@@ -1,5 +1,7 @@
 # ROCm Forensics Toolkit
 
+**简体中文** | [English](README_EN.md)
+
 > AMD GPU queue、KFD、SDMA、CPC、Wave 与 ROCclr 运行时故障采集工具集。
 
 本项目提供一组面向 AMD GPU hang、queue stall、signal wait、SDMA timeout
