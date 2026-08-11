@@ -16,6 +16,7 @@
 - 读取所有 GPU/XCC 的 CPC、Wave 与 SDMA 状态
 - 从 Docker 容器收集 ROCclr/AMD runtime 日志
 - 按 PID 导出完整保留的 user queue ring
+- 按 DRM category 和内核源码文件选择性开启 debug 日志
 - 自动生成带时间戳的目录、汇总文件和压缩包
 
 ## 环境要求
@@ -187,6 +188,22 @@ Queue 自动发现测试的兼容入口，转发参数到
 ./10_dump_full_user_queue_rings.sh \
   --pid 875176 --pci 0000:0a:00.0 --vm-partition 0
 ```
+
+### `11_configure_drm_debug.sh`
+
+选择性开启或关闭 `drm.debug` category，以及指定内核源码文件的
+dynamic-debug callsite。脚本只修改明确指定的 category 和文件。
+
+```bash
+./11_configure_drm_debug.sh enable --drm driver,kms \
+  --file amdgpu_job.c --file kfd_chardev.c
+./11_configure_drm_debug.sh disable --drm kms --file amdgpu_job.c
+./11_configure_drm_debug.sh show --file kfd_chardev.c
+```
+
+文件通配符需要使用引号，例如
+`--file 'drivers/gpu/drm/amd/amdgpu/*.c'`。配置会保持到手动关闭、再次修改
+或系统重启；可先加 `--dry-run` 检查将要执行的写操作。
 
 ## Debug bundle 结构
 

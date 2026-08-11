@@ -19,6 +19,7 @@ analysis.
 - Read CPC, wave, and SDMA state from every GPU/XCC
 - Collect ROCclr/AMD runtime logs from Docker containers
 - Dump the full retained user-queue ring for a process
+- Selectively enable debug logs by DRM category and kernel source file
 - Generate timestamped directories, summaries, and compressed archives
 
 ## Requirements
@@ -199,6 +200,24 @@ GPU, and use UMR `use_full_user_queue` to dump the full retained ring.
 ./10_dump_full_user_queue_rings.sh \
   --pid 875176 --pci 0000:0a:00.0 --vm-partition 0
 ```
+
+### `11_configure_drm_debug.sh`
+
+Selectively enable or disable `drm.debug` categories and dynamic-debug
+callsites in specified kernel source files. Only explicitly selected categories
+and files are changed.
+
+```bash
+./11_configure_drm_debug.sh enable --drm driver,kms \
+  --file amdgpu_job.c --file kfd_chardev.c
+./11_configure_drm_debug.sh disable --drm kms --file amdgpu_job.c
+./11_configure_drm_debug.sh show --file kfd_chardev.c
+```
+
+Quote file globs, for example
+`--file 'drivers/gpu/drm/amd/amdgpu/*.c'`. Settings remain active until they are
+disabled, changed again, or the system reboots. Add `--dry-run` to inspect all
+writes first.
 
 ## Debug bundle layout
 
