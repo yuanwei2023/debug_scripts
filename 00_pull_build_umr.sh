@@ -8,9 +8,9 @@
 set -euo pipefail
 
 UMR_DIR="${UMR_DIR:-${HOME}/umr}"
-UMR_REPOSITORY="${UMR_REPOSITORY:-https://github.com/yuanwei2023/umr.git}"
+UMR_REPOSITORY="${UMR_REPOSITORY:-https://gitlab.freedesktop.org/tomstdenis/umr.git/}"
 UMR_REMOTE="${UMR_REMOTE:-origin}"
-UMR_BRANCH="${UMR_BRANCH:-308-v2}"
+UMR_BRANCH="${UMR_BRANCH:-main}"
 JOBS="${JOBS:-$(nproc)}"
 LLVM_PACKAGE="${LLVM_PACKAGE:-llvm-devel}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
