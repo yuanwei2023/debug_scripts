@@ -1,0 +1,4 @@
+{
+  "name": "ROCm Forensics Toolkit",
+  "install": "sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck"
+}
