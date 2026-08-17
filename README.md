@@ -114,6 +114,13 @@ When `--pid` is omitted, the tool uses `amd-smi` to find
 Read status, GFX, PAGE, RLC, and XNACK registers from every GPU and SDMA
 instance. This collector is read-only and never writes hardware registers.
 
+Before any register read, the script resolves `UMR` (executable or source tree),
+records the UMR path and version in the log header, and verifies that the
+selected UMR is **>= 1.0.11** and supports the commands this collector uses
+(`--script instances`, `-lb`, `-vmp`, `-O`, `-r`). An older or incomplete UMR
+fails early with an actionable error. Build or refresh UMR with
+`./00_pull_build_umr.sh` when needed, or set `UMR=/path/to/newer/umr`.
+
 ```bash
 ./03_dump_sdma_registers.sh
 ./03_dump_sdma_registers.sh --vmp 1 -o /tmp/sdma-registers.log

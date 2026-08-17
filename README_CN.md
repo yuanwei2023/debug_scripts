@@ -106,6 +106,12 @@ python3 02_umr_queue_doctor.py \
 只读采集所有 GPU 和 SDMA instance 的 status、GFX、PAGE、RLC 与 XNACK
 寄存器，不写入硬件寄存器。
 
+在任何寄存器读取之前，脚本会解析 `UMR`（可执行文件或源码目录），将 UMR
+路径与版本写入日志头，并检查所选 UMR 版本是否 **>= 1.0.11**，以及是否支持本
+采集器使用的命令（`--script instances`、`-lb`、`-vmp`、`-O`、`-r`）。版本过旧
+或不完整的 UMR 会提前失败并给出可操作的错误提示。需要时可运行
+`./00_pull_build_umr.sh` 构建或更新 UMR，或设置 `UMR=/path/to/newer/umr`。
+
 ```bash
 ./03_dump_sdma_registers.sh
 ./03_dump_sdma_registers.sh --vmp 1 -o /tmp/sdma-registers.log

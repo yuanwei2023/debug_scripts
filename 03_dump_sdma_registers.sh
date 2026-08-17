@@ -170,13 +170,162 @@ if [[ -z "$UMR" ]]; then
 fi
 
 if [[ ! -x "$UMR" ]]; then
-  echo "ERROR: UMR executable not found: $UMR" >&2
+  echo "ERROR: UMR executable not found." >&2
+  echo "Set UMR to an executable or source tree, or build one with:" >&2
+  echo "  ./00_pull_build_umr.sh" >&2
+  if [[ -n "${UMR:-}" ]]; then
+    echo "Requested path: $UMR" >&2
+  fi
   exit 1
 fi
+
+UMR_MIN_VERSION="1.0.11"
 
 iso_time() {
   date '+%Y-%m-%dT%H:%M:%S.%3N%:z'
 }
+
+UMR_VERSION=""
+UMR_VERSION_RAW=""
+
+# Extract the numeric dotted core from strings like 1.0.11, 1.0.11-dev, or
+# 1.0.11-299-ga12fd44 so comparisons stay numeric instead of lexicographic.
+umr_version_core() {
+  local version="$1"
+  if [[ "$version" =~ ^([0-9]+(\.[0-9]+)*) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+# Return 0 when $1 >= $2 for dotted numeric versions.
+version_ge() {
+  local left right
+  left="$(umr_version_core "$1")" || return 1
+  right="$(umr_version_core "$2")" || return 1
+
+  local IFS=.
+  local -a left_parts=() right_parts=()
+  read -r -a left_parts <<<"$left"
+  read -r -a right_parts <<<"$right"
+
+  local max_len="${#left_parts[@]}"
+  if (( ${#right_parts[@]} > max_len )); then
+    max_len="${#right_parts[@]}"
+  fi
+
+  local i left_part right_part
+  for (( i = 0; i < max_len; i++ )); do
+    left_part="${left_parts[i]:-0}"
+    right_part="${right_parts[i]:-0}"
+    if (( 10#$left_part > 10#$right_part )); then
+      return 0
+    fi
+    if (( 10#$left_part < 10#$right_part )); then
+      return 1
+    fi
+  done
+  return 0
+}
+
+write_sdma_log_header() {
+  {
+    echo "# SDMA register dump"
+    echo "# started=$(iso_time)"
+    echo "# UMR=$UMR"
+    echo "# UMR_min_version=$UMR_MIN_VERSION"
+    echo "# UMR_version=${UMR_VERSION:-unknown}"
+    [[ -n "$UMR_VERSION_RAW" && "$UMR_VERSION_RAW" != "$UMR_VERSION" ]] &&
+      echo "# UMR_version_raw=$UMR_VERSION_RAW"
+  } >>"$LOG_FILE"
+}
+
+fail_umr_precheck() {
+  local reason="$1"
+  shift
+  mkdir -p "$(dirname -- "$LOG_FILE")"
+  : >"$LOG_FILE"
+  write_sdma_log_header
+  {
+    echo "ERROR: $reason"
+    echo
+    echo "# hint: UMR prints its version on the first line of: $UMR -h"
+    echo "# hint: build or refresh UMR with: ./00_pull_build_umr.sh"
+    echo "# hint: or set UMR=/path/to/newer/umr"
+    while (( $# > 0 )); do
+      echo "$1"
+      shift
+    done
+  } >>"$LOG_FILE"
+  echo "ERROR: $reason" >&2
+  echo "See log: $LOG_FILE" >&2
+  exit 1
+}
+
+fail_umr_version() {
+  local detected_version="$1"
+  fail_umr_precheck \
+    "UMR version ${detected_version:-unknown} is below required >= ${UMR_MIN_VERSION}" \
+    "# UMR=$UMR" \
+    "# detected_version=${detected_version:-unknown}" \
+    "# required_version>=${UMR_MIN_VERSION}" \
+    "# hint: build or refresh UMR with: ./00_pull_build_umr.sh" \
+    "# hint: or set UMR=/path/to/newer/umr"
+}
+
+verify_umr_for_sdma_dump() {
+  local help_text script_help missing=()
+
+  if ! help_text="$("$UMR" -h 2>&1)"; then
+    fail_umr_precheck "UMR help probe failed: $UMR -h"
+  fi
+
+  UMR_VERSION_RAW="$(head -n 1 <<<"$help_text")"
+  if [[ -z "$UMR_VERSION_RAW" ]]; then
+    fail_umr_precheck "UMR produced no help output; cannot determine version"
+  fi
+  if [[ "$UMR_VERSION_RAW" != *"User Mode Register debugger"* ]]; then
+    fail_umr_precheck \
+      "UMR help output is unexpected; cannot determine version (run: $UMR -h)"
+  fi
+
+  if [[ "$UMR_VERSION_RAW" =~ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+    UMR_VERSION="${BASH_REMATCH[1]}"
+  elif [[ "$UMR_VERSION_RAW" =~ \(build:[[:space:]]*([^,]+) ]]; then
+    UMR_VERSION="${BASH_REMATCH[1]}"
+  else
+    UMR_VERSION="$UMR_VERSION_RAW"
+  fi
+
+  if ! umr_version_core "$UMR_VERSION" >/dev/null; then
+    fail_umr_precheck \
+      "UMR version could not be parsed from help output (run: $UMR -h)"
+  fi
+  if ! version_ge "$UMR_VERSION" "$UMR_MIN_VERSION"; then
+    fail_umr_version "$UMR_VERSION"
+  fi
+
+  for token in '--script' '--list-blocks' '-lb' '-vmp' '-O' '-r' '-i'; do
+    if ! grep -qF -- "$token" <<<"$help_text"; then
+      missing+=("$token")
+    fi
+  done
+
+  if ! script_help="$("$UMR" --script 2>&1)"; then
+    fail_umr_precheck "UMR --script probe failed (required for GPU discovery)"
+  fi
+  if ! grep -qw 'instances' <<<"$script_help"; then
+    missing+=('--script instances')
+  fi
+
+  if (( ${#missing[@]} > 0 )); then
+    fail_umr_precheck \
+      "UMR lacks required SDMA dump features: ${missing[*]}"
+  fi
+}
+
+verify_umr_for_sdma_dump
 
 normalize_bdf() {
   printf '%s' "${1,,}"
@@ -261,8 +410,7 @@ mapfile -t UMR_INSTANCES < <(
 
 if (( ${#UMR_INSTANCES[@]} == 0 )); then
   {
-    echo "# SDMA register dump"
-    echo "# started=$(iso_time)"
+    write_sdma_log_header
     echo "ERROR: no GPU instances returned by 'umr --script instances'"
     echo
     echo "# AMD-SMI snapshot"
@@ -302,10 +450,8 @@ mapfile -t SORTED_UMR_INSTANCES < <(
 # Write all identification information and bare AMD-SMI output immediately, so
 # they remain available even if register collection is interrupted later.
 {
-  echo "# SDMA register dump"
-  echo "# started=$(iso_time)"
+  write_sdma_log_header
   echo "# hostname=$(hostname)"
-  echo "# UMR=$UMR"
   echo "# gpu_index_policy=KFD/ROCm Node ID"
   echo "# VMP=$VMP"
   echo "# requested_register_count=${#REGISTERS[@]}"
