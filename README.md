@@ -219,6 +219,42 @@ Quote file globs, for example
 disabled, changed again, or the system reboots. Add `--dry-run` to inspect all
 writes first.
 
+### `00_pull_build_gdb.sh`
+
+Build upstream GNU GDB with Python 3.11 into a local prefix. This is optional;
+`06_collect_all_gpu_debug.sh` and `13_dump_aql_queues_gdb.sh` do not require it.
+
+```bash
+./00_pull_build_gdb.sh
+./00_pull_build_gdb.sh --prefix /path/to/gdb --python /usr/bin/python3.11
+./00_pull_build_gdb.sh --force-rebuild
+./00_pull_build_gdb.sh --install-bashrc
+```
+
+Default install location:
+
+```text
+tools/gdb-14.2/bin/gdb
+```
+
+After a successful build, the script prints an optional `export GDB=...` line.
+Scripts `06` and `13` still default to system GDB unless you set `GDB`.
+
+Use it for the current shell:
+
+```bash
+export GDB=/path/to/tools/gdb-14.2/bin/gdb
+./13_dump_aql_queues_gdb.sh --pid 875176
+```
+
+To persist across logins, append the export to `~/.bashrc` manually, or run:
+
+```bash
+./00_pull_build_gdb.sh --install-bashrc
+```
+
+Re-run with `--force-rebuild` to upgrade GDB in the same prefix later.
+
 ## Debug bundle layout
 
 A typical unified collection directory:
@@ -247,6 +283,7 @@ and `.tgz` archive.
 - `LOG_FILE`: output path for single-file collectors
 - `AMD_SMI`: path to the `amd-smi` executable
 - `DMESG`: path to the `dmesg` executable
+- `GDB`: optional GDB executable for AQL queue dumps (scripts `06`/`13`)
 
 Options differ between scripts. Check the corresponding help before running a
 collector:
@@ -301,6 +338,27 @@ Confirm that debugfs is mounted and that the current user has `sudo` access:
 ```bash
 sudo mount -t debugfs none /sys/kernel/debug
 ```
+
+### GDB reports DWARF errors during AQL dump
+
+If queue enumeration still succeeds, the dump is usually valid. To suppress
+DWARF 5 compatibility warnings from older system GDB versions, build and use a
+newer GDB:
+
+```bash
+./00_pull_build_gdb.sh
+export GDB=/path/to/tools/gdb-14.2/bin/gdb
+./13_dump_aql_queues_gdb.sh --pid 875176
+```
+
+Optional persistence in `~/.bashrc` (only if you choose):
+
+```bash
+./00_pull_build_gdb.sh --install-bashrc
+```
+
+`00_pull_build_gdb.sh` never modifies `~/.bashrc` unless you pass
+`--install-bashrc`.
 
 ## License
 

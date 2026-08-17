@@ -205,6 +205,42 @@ dynamic-debug callsite。脚本只修改明确指定的 category 和文件。
 `--file 'drivers/gpu/drm/amd/amdgpu/*.c'`。配置会保持到手动关闭、再次修改
 或系统重启；可先加 `--dry-run` 检查将要执行的写操作。
 
+### `00_pull_build_gdb.sh`
+
+将 upstream GNU GDB（带 Python 3.11 支持）编译安装到本地 prefix。这是可选项；
+`06_collect_all_gpu_debug.sh` 和 `13_dump_aql_queues_gdb.sh` 都不依赖它。
+
+```bash
+./00_pull_build_gdb.sh
+./00_pull_build_gdb.sh --prefix /path/to/gdb --python /usr/bin/python3.11
+./00_pull_build_gdb.sh --force-rebuild
+./00_pull_build_gdb.sh --install-bashrc
+```
+
+默认安装路径：
+
+```text
+tools/gdb-14.2/bin/gdb
+```
+
+构建成功后，脚本会打印可选的 `export GDB=...` 用法。未设置 `GDB` 时，
+脚本 `06` 和 `13` 仍默认使用系统 GDB。
+
+当前 shell 临时使用：
+
+```bash
+export GDB=/path/to/tools/gdb-14.2/bin/gdb
+./13_dump_aql_queues_gdb.sh --pid 875176
+```
+
+如需登录后自动生效，可手动追加到 `~/.bashrc`，或运行：
+
+```bash
+./00_pull_build_gdb.sh --install-bashrc
+```
+
+后续可用 `--force-rebuild` 在同一 prefix 下升级 GDB。
+
 ## Debug bundle 结构
 
 典型的一键采集目录：
@@ -232,6 +268,7 @@ gpu_debug_bundle_<HOST>_<TIMESTAMP>/
 - `LOG_FILE`：单文件 collector 的输出路径
 - `AMD_SMI`：`amd-smi` 可执行文件路径
 - `DMESG`：`dmesg` 可执行文件路径
+- `GDB`：AQL queue dump（脚本 `06`/`13`）使用的可选 GDB 路径
 
 每个脚本的参数可能不同，请优先查看对应帮助：
 
@@ -281,6 +318,26 @@ ls /sys/class/kfd/kfd/proc/<PID>/queues
 ```bash
 sudo mount -t debugfs none /sys/kernel/debug
 ```
+
+### AQL dump 出现 GDB DWARF 报错
+
+若 queue 枚举仍然成功，dump 通常有效。若要消除旧版系统 GDB 的 DWARF 5
+兼容性警告，可编译并使用较新的 GDB：
+
+```bash
+./00_pull_build_gdb.sh
+export GDB=/path/to/tools/gdb-14.2/bin/gdb
+./13_dump_aql_queues_gdb.sh --pid 875176
+```
+
+可选：写入 `~/.bashrc`（仅在你主动选择时）：
+
+```bash
+./00_pull_build_gdb.sh --install-bashrc
+```
+
+`00_pull_build_gdb.sh` 不会自动修改 `~/.bashrc`，除非传入
+`--install-bashrc`。
 
 ## License
 
