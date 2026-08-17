@@ -7,8 +7,6 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 GDB_SCRIPT="${SCRIPT_DIR}/aql_packet_decode_gdb.py"
-# shellcheck source=capture_amd_smi.sh
-source "${SCRIPT_DIR}/capture_amd_smi.sh"
 DEFAULT_LOG_ROOT="${DEBUG_TOOLS_TMP_DIR:-/tmp/debug-tools-${SUDO_UID:-$(id -u)}}"
 PID=""
 OUTPUT_DIR=""
@@ -207,6 +205,20 @@ else
   OUTPUT_DIR="$(dirname -- "$OUTPUT_FILE")"
 fi
 
+amd_smi_log="${OUTPUT_DIR}/amd-smi.log"
+amd_smi_bin="${AMD_SMI:-$(command -v amd-smi 2>/dev/null || true)}"
+{
+  echo "# captured: $(date -Is 2>/dev/null || date)"
+  echo "# command: amd-smi"
+  echo
+  if [[ -n "${amd_smi_bin}" && -x "${amd_smi_bin}" ]]; then
+    "${amd_smi_bin}" 2>&1 || echo "[ERROR] amd-smi exited $?"
+  else
+    echo "[ERROR] amd-smi unavailable"
+  fi
+} >"${amd_smi_log}"
+log "amd-smi: ${amd_smi_log}"
+
 tmp_output="${OUTPUT_DIR}/.aql_packet_decode_gdb.${PID}.$$.tmp"
 gdb_log="${OUTPUT_DIR}/.aql_packet_decode_gdb.${PID}.$$.gdb.log"
 cleanup() {
@@ -217,10 +229,6 @@ trap cleanup EXIT
 select_gdb || die "GDB with Python support is required (set GDB or --gdb)"
 log "debugger: ${GDB_BIN}"
 log "output: ${OUTPUT_FILE}"
-
-amd_smi_log="${OUTPUT_DIR}/amd-smi.log"
-capture_amd_smi_log "${amd_smi_log}"
-log "amd-smi: ${amd_smi_log}"
 
 gdb_args=(-q -batch -p "${PID}" -ex "set confirm off")
 if [[ -n "$SOLIB_SEARCH_PATH" ]]; then

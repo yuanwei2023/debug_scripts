@@ -2,7 +2,7 @@
 #
 # Author: Perry_Yuan@outlook.com
 # Log History:
-#   2026-08-03 - Added unified collection and automatic Queue Doctor discovery.
+#   2026-08-03 - Added unified collection for GPU debug artifacts.
 #   2026-08-03 - Added dedicated all-GPU wave snapshots under waves/.
 
 set -uo pipefail
@@ -11,8 +11,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ORIGINAL_ARGS=("$@")
 DEFAULT_LOG_ROOT="${DEBUG_TOOLS_TMP_DIR:-/tmp/debug-tools-${SUDO_UID:-$(id -u)}}"
 PID=""
-QUEUE_PROCESS_NAME="${QUEUE_PROCESS_NAME:-torch_server.bin}"
-DISCOVERED_PIDS=()
+QUEUE_PIDS=()
 GPU_IDS=()
 NODE_IDS=()
 USE_ALL_GPUS=1
@@ -28,19 +27,18 @@ SKIP_SDMA=0
 SKIP_KFD=0
 SKIP_CPC=0
 SKIP_WAVES=0
+SKIP_AQL_QUEUE=0
 CREATE_ARCHIVE=1
 
 usage() {
   cat <<'EOF'
-Usage: ./06_collect_all_gpu_debug.sh [options]
+Usage: ./06_collect_all_gpu_debug.sh --pid PID [options]
 
 Run the GPU debug collectors sequentially and package their artifacts into one
-timestamped directory. Without --pid, Queue Doctor discovers PIDs for
-torch_server.bin from amd-smi.
+timestamped directory. --pid is required for Queue Doctor and AQL queue dump.
 
 Options:
-  --pid PID             Target process ID for Queue Doctor
-  --process-name NAME   Auto-discovery process name (default: torch_server.bin)
+  --pid PID             Target process ID (required)
   --gpu-id ID           AMD-SMI GPU ID; may be repeated (default: all PID GPUs)
   --node-id ID          KFD topology node ID; may be repeated
   --samples N           Queue/KFD snapshot count (default: 3)
@@ -55,13 +53,12 @@ Options:
   --skip-kfd            Skip KFD snapshots
   --skip-cpc            Skip CPC/system-state collection
   --skip-waves          Skip dedicated all-GPU wave snapshots
+  --skip-aql-queue      Skip AQL/SDMA gdb queue dump (13_dump_aql_queues_gdb.sh)
   --no-archive          Do not create the final .tgz archive
   -h, --help            Show this help
 
 Examples:
-  ./06_collect_all_gpu_debug.sh
   ./06_collect_all_gpu_debug.sh --pid 4008481
-  ./06_collect_all_gpu_debug.sh --process-name torch_server.bin
   ./06_collect_all_gpu_debug.sh --pid 4008481 --gpu-id 0 --vmp 2
 
 Important:
@@ -69,6 +66,9 @@ Important:
 
 Environment:
   DEBUG_TOOLS_TMP_DIR  Default temporary output root
+  GDB                  Optional GDB for script 13 (default: /usr/bin/gdb)
+  GDB_TIMEOUT          Attach/decode timeout for AQL queue dump (default: 120)
+  LD_PRELOAD           Optional; use when invoking 06 if script 13 needs it
 EOF
 }
 
@@ -81,14 +81,13 @@ require_value() {
 
 while (($# > 0)); do
   case "$1" in
+    --pid=*)
+      PID="${1#*=}"
+      shift
+      ;;
     --pid)
       require_value "$@"
       PID="$2"
-      shift 2
-      ;;
-    --process-name)
-      require_value "$@"
-      QUEUE_PROCESS_NAME="$2"
       shift 2
       ;;
     --gpu-id)
@@ -155,6 +154,10 @@ while (($# > 0)); do
       SKIP_WAVES=1
       shift
       ;;
+    --skip-aql-queue)
+      SKIP_AQL_QUEUE=1
+      shift
+      ;;
     --no-archive)
       CREATE_ARCHIVE=0
       shift
@@ -171,12 +174,13 @@ while (($# > 0)); do
   esac
 done
 
-if [[ -n "$PID" && ! "$PID" =~ ^[1-9][0-9]*$ ]]; then
-  echo "PID must be a positive integer: ${PID}" >&2
+if [[ -z "$PID" ]]; then
+  echo "--pid is required" >&2
+  usage >&2
   exit 2
 fi
-if [[ -z "$QUEUE_PROCESS_NAME" ]]; then
-  echo "Process name must not be empty" >&2
+if [[ ! "$PID" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PID must be a positive integer: ${PID}" >&2
   exit 2
 fi
 if [[ ! "$SAMPLES" =~ ^[1-9][0-9]*$ ]]; then
@@ -208,7 +212,8 @@ for script in \
   03_dump_sdma_registers.sh \
   04_dump_kfd_snapshots.sh \
   05_dump_all_cpc_info.sh \
-  08_dump_all_gpu_waves.sh; do
+  08_dump_all_gpu_waves.sh \
+  13_dump_aql_queues_gdb.sh; do
   if [[ ! -e "${SCRIPT_DIR}/${script}" ]]; then
     echo "Required collector is missing: ${SCRIPT_DIR}/${script}" >&2
     exit 1
@@ -238,6 +243,7 @@ if [[ -e "$OUTPUT_DIR" ]]; then
 fi
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd -- "$OUTPUT_DIR" && pwd)"
+QUEUE_PIDS=("$PID")
 
 RUN_LOG="${OUTPUT_DIR}/collector.log"
 SUMMARY="${OUTPUT_DIR}/summary.txt"
@@ -341,44 +347,20 @@ fail_step() {
   log "END ${step}: FAIL reason=${reason}; continuing"
 }
 
-discover_queue_pids() {
-  local amd_smi output rc
+run_aql_queue_dump() {
+  local target_pid="$1"
+  local out_dir="$2"
+  local dump_script="${SCRIPT_DIR}/13_dump_aql_queues_gdb.sh"
 
-  output="${OUTPUT_DIR}/amd-smi-process-discovery.log"
-  amd_smi="$(command -v amd-smi 2>/dev/null || true)"
-  if [[ -z "$amd_smi" || ! -x "$amd_smi" ]]; then
-    echo "amd-smi is unavailable; cannot discover ${QUEUE_PROCESS_NAME} PID" \
-      >&2
-    return 127
-  fi
-
-  echo "Running ${amd_smi} to discover process name: ${QUEUE_PROCESS_NAME}"
-  "$amd_smi" >"$output" 2>&1
-  rc=$?
-  awk '{ print }' "$output"
-  if ((rc != 0)); then
-    echo "amd-smi failed with rc=${rc}" >&2
-    return "$rc"
-  fi
-
-  mapfile -t DISCOVERED_PIDS < <(
-    awk -v process_name="$QUEUE_PROCESS_NAME" '
-      $1 == "|" &&
-      $3 ~ /^[1-9][0-9]*$/ &&
-      $4 == process_name {
-        print $3
-      }
-    ' "$output" | sort -nu
-  )
-
-  if ((${#DISCOVERED_PIDS[@]} == 0)); then
-    echo "No ${QUEUE_PROCESS_NAME} process was found in amd-smi output" >&2
+  if [[ ! -d "/proc/${target_pid}" ]]; then
+    echo "PID ${target_pid} is not running; skipping AQL queue dump" >&2
     return 3
   fi
 
-  printf 'Discovered %s PID(s):' "$QUEUE_PROCESS_NAME"
-  printf ' %s' "${DISCOVERED_PIDS[@]}"
-  printf '\n'
+  mkdir -p "$out_dir"
+  echo "AQL queue dump PID=${target_pid} output=${out_dir}"
+  GDB_TIMEOUT="${GDB_TIMEOUT:-120}" \
+    "${dump_script}" --pid "${target_pid}" --output-dir "${out_dir}"
 }
 
 {
@@ -430,30 +412,8 @@ fi
 if ((SKIP_QUEUE == 1)); then
   skip_step "queue_doctor" "disabled"
 else
-  QUEUE_PIDS=()
-  queue_pid_source="explicit"
-  if [[ -n "$PID" ]]; then
-    QUEUE_PIDS=("$PID")
-    skip_step "queue_pid_discovery" "explicit-pid"
-  else
-    queue_pid_source="amd-smi"
-    run_step "queue_pid_discovery" discover_queue_pids
-    if ((LAST_STEP_RC == 0)); then
-      QUEUE_PIDS=("${DISCOVERED_PIDS[@]}")
-    else
-      fail_step "queue_doctor" \
-        "no-${QUEUE_PROCESS_NAME}-pid-from-amd-smi"
-    fi
-  fi
-
-  if ((${#QUEUE_PIDS[@]} > 0)); then
-    {
-      echo "source=${queue_pid_source}"
-      echo "process_name=${QUEUE_PROCESS_NAME}"
-      printf 'pids='
-      printf '%s ' "${QUEUE_PIDS[@]}"
-      printf '\n'
-    } >"${OUTPUT_DIR}/queue_pid_selection.txt"
+  if ((${#QUEUE_PIDS[@]} == 0)); then
+    fail_step "queue_doctor" "no-target-pid"
   fi
 
   for queue_pid in "${QUEUE_PIDS[@]}"; do
@@ -484,9 +444,23 @@ else
     fi
     run_step "$queue_step" "${queue_command[@]}"
   done
+fi
 
-  if ((${#QUEUE_PIDS[@]} == 0 && LAST_STEP_RC == 0)); then
-    fail_step "queue_doctor" "empty-pid-selection"
+if ((SKIP_AQL_QUEUE == 1)); then
+  skip_step "aql_queue_dump" "disabled"
+else
+  if ((${#QUEUE_PIDS[@]} == 0)); then
+    fail_step "aql_queue_dump" "no-target-pid"
+  else
+    for queue_pid in "${QUEUE_PIDS[@]}"; do
+      aql_step="aql_queue_dump"
+      aql_output="${OUTPUT_DIR}/aql_queue_dump"
+      if ((${#QUEUE_PIDS[@]} > 1)); then
+        aql_step="aql_queue_dump_pid${queue_pid}"
+        aql_output="${OUTPUT_DIR}/aql_queue_dump_pid${queue_pid}"
+      fi
+      run_step "$aql_step" run_aql_queue_dump "$queue_pid" "$aql_output"
+    done
   fi
 fi
 

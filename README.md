@@ -19,6 +19,7 @@ analysis.
 - Read CPC, wave, and SDMA state from every GPU/XCC
 - Collect ROCclr/AMD runtime logs from Docker containers
 - Dump the full retained user-queue ring for a process
+- Read process GPU virtual memory and queue-visible HSA signal values
 - Selectively enable debug logs by DRM category and kernel source file
 - Generate timestamped directories, summaries, and compressed archives
 
@@ -55,16 +56,10 @@ The default source is the upstream UMR `main` branch. To generate an RPM:
 
 ### 2. Collect a complete debug bundle
 
-Select a process by PID:
+Specify the target process PID (required):
 
 ```bash
 ./06_collect_all_gpu_debug.sh --pid 4008481
-```
-
-Discover the PID by process name:
-
-```bash
-./06_collect_all_gpu_debug.sh --process-name torch_server.bin
 ```
 
 Include full retained rings:
@@ -135,6 +130,31 @@ indefinitely.
 ./04_dump_kfd_snapshots.sh --dynamic-debug
 ```
 
+### `15_trace_kfd_queue.sh`
+
+Standalone KFD queue/runlist dynamic-debug helper. It enables selected
+`printk` callsites in KFD source files (by file, format string, or func name)
+and sets `amdgpu.debug_evictions=1` and `amdgpu.halt_if_hws_hang=1`, then
+optionally follows the kernel journal. Eviction worker funcs use `+pfl`; other
+rules use `+p`. This script is **not** invoked by `06_collect_all_gpu_debug.sh`.
+
+```bash
+./15_trace_kfd_queue.sh status
+./15_trace_kfd_queue.sh enable
+./15_trace_kfd_queue.sh capture ./kfd-queue.log
+./15_trace_kfd_queue.sh disable
+```
+
+Requirements:
+
+- `CONFIG_DYNAMIC_DEBUG` (`/proc/dynamic_debug/control` or debugfs equivalent)
+- `sudo` access
+- Loaded `amdgpu` module with `debug_evictions` and `halt_if_hws_hang` sysfs
+  parameters
+
+`capture` enables debug, tees `journalctl -k -f` into LOG until Ctrl-C, and
+leaves debug enabled; run `disable` explicitly when finished.
+
 ### `05_dump_all_cpc_info.sh`
 
 Collect CPC, wave, KFD runlist, firmware, module parameter, and kernel-log
@@ -150,7 +170,8 @@ controlled debugging environment.
 ### `06_collect_all_gpu_debug.sh`
 
 The recommended entry point. It runs Queue Doctor, SDMA, KFD, CPC, and wave
-collectors sequentially and produces one unified debug bundle.
+collectors sequentially and produces one unified debug bundle. `--pid` is
+required; the script does not auto-discover target PIDs.
 
 ```bash
 ./06_collect_all_gpu_debug.sh --pid 4008481
@@ -158,13 +179,13 @@ collectors sequentially and produces one unified debug bundle.
   --pid 4008481 --samples 3 --interval 5 --vmp 0
 ```
 
-Use `--skip-queue`, `--skip-sdma`, `--skip-kfd`, `--skip-cpc`, or
-`--skip-waves` to disable individual collectors.
+Use `--skip-queue`, `--skip-sdma`, `--skip-kfd`, `--skip-cpc`,
+`--skip-waves`, or `--skip-aql-queue` to disable individual collectors.
 
-### `07_demo_queue_auto_discovery.sh`
-
-A compatibility entry point for queue auto-discovery tests. It forwards its
-arguments to `tests/run_queue_auto_discovery_test.sh`.
+When enabled, the bundle also includes an AQL/SDMA gdb dump under
+`aql_queue_dump/` (or `aql_queue_dump_pid<PID>/` for multiple targets).
+Optional `GDB` and `LD_PRELOAD` environment variables are forwarded to script
+`13` when you set them before running `06`.
 
 ### `08_dump_all_gpu_waves.sh`
 
@@ -219,10 +240,68 @@ Quote file globs, for example
 disabled, changed again, or the system reboots. Add `--dry-run` to inspect all
 writes first.
 
+### `12_read_process_gpu_memory.py`
+
+Bind UMR to a live KFD process and read a GPU virtual address, a half-open
+address range, one or more HSA signal handles, or signal handles discovered
+from the process queue packets.
+
+```bash
+./12_read_process_gpu_memory.py --pid 1234 --address 0x7f0000001000
+./12_read_process_gpu_memory.py --pid 1234 \
+  --range 0x7f0000001000 0x7f0000001100
+./12_read_process_gpu_memory.py --pid 1234 \
+  --signal 0x7f0000123400
+./12_read_process_gpu_memory.py --pid 1234 --all-signals
+./12_read_process_gpu_memory.py --pid 1234 --all-signals --full-ring
+```
+
+`--all-signals` reports nonzero `dep_signal` and `completion_signal` handles,
+plus recognizable HSA signal addresses used by SDMA poll/atomic packets.
+These are all signals visible in the captured queues, not every signal
+allocated internally by ROCr. `--full-ring` also scans retained historical
+packets, so some discovered handles can already be destroyed and appear as
+`invalid/stale`.
+
+### `13_dump_aql_queues_gdb.sh`
+
+Attach GDB to a live process and decode HSA AQL queues plus SDMA blit rings by
+sourcing `aql_packet_decode_gdb.py`. The script only performs the
+attach/decode/detach dump; it does not start workloads or change ROCm runtime
+settings inside the target process.
+
+Requirements: the selected GDB must be executable and support Python scripting.
+Script `13` does not check or require a minimum or specific GDB version. Default
+is `/usr/bin/gdb`; override with `GDB` or `--gdb`.
+
+```bash
+./13_dump_aql_queues_gdb.sh --pid 875176
+./13_dump_aql_queues_gdb.sh --pid=875176 -o /tmp/queue_dump
+```
+
+Output directory contents:
+
+```text
+aql_queue_dump/
+├── aql_packet_decode_gdb.txt
+└── amd-smi.log
+```
+
+Optional environment variables:
+
+- `GDB`: GDB with Python support (default: `/usr/bin/gdb`)
+- `GDB_TIMEOUT`: attach/decode timeout in seconds (default: `120`)
+- `LD_PRELOAD`: set by the caller when debug ROCr symbols are required
+- `SOLIB_SEARCH_PATH`, `DEBUG_FILE_DIRECTORY`: forwarded to GDB when needed
+
+See [Optional: LD_PRELOAD and upgraded GDB](#optional-ld_preload-and-upgraded-gdb)
+below for local debug-runtime and DWARF 5 setup.
+
 ### `00_pull_build_gdb.sh`
 
-Build upstream GNU GDB with Python 3.11 into a local prefix. This is optional;
-`06_collect_all_gpu_debug.sh` and `13_dump_aql_queues_gdb.sh` do not require it.
+Build upstream GNU GDB with Python 3.11 into a local prefix. This is optional
+and is not required by `06_collect_all_gpu_debug.sh` or
+`13_dump_aql_queues_gdb.sh`.
 
 ```bash
 ./00_pull_build_gdb.sh
@@ -238,12 +317,13 @@ tools/gdb-14.2/bin/gdb
 ```
 
 After a successful build, the script prints an optional `export GDB=...` line.
-Scripts `06` and `13` still default to system GDB unless you set `GDB`.
+Script `13` still defaults to `/usr/bin/gdb` unless you set `GDB`; it does not
+require or auto-select the locally built GDB.
 
 Use it for the current shell:
 
 ```bash
-export GDB=/path/to/tools/gdb-14.2/bin/gdb
+export GDB=/path/to/your/gdb-with-python
 ./13_dump_aql_queues_gdb.sh --pid 875176
 ```
 
@@ -255,6 +335,76 @@ To persist across logins, append the export to `~/.bashrc` manually, or run:
 
 Re-run with `--force-rebuild` to upgrade GDB in the same prefix later.
 
+## Optional: LD_PRELOAD and upgraded GDB
+
+These are optional enhancements for local debugging with debug-symbol ROCr/HIP
+builds. Neither `06_collect_all_gpu_debug.sh` nor `13_dump_aql_queues_gdb.sh`
+sets them automatically.
+
+### When to use `LD_PRELOAD`
+
+Use `LD_PRELOAD` when the target process was started with a local debug
+`libhsa-runtime64.so` from `rocm-systems/build`, for example:
+
+```bash
+export LD_PRELOAD=/path/to/rocm-systems/build/airuntime-2291/rocr/rocr/lib/libhsa-runtime64.so.1.21.0
+./13_dump_aql_queues_gdb.sh --pid 875176
+```
+
+For one-click collection with script `06`:
+
+```bash
+LD_PRELOAD=/path/to/libhsa-runtime64.so.1.21.0 \
+  ./06_collect_all_gpu_debug.sh --pid 875176
+```
+
+Script `13` does not modify the target runtime environment. `LD_PRELOAD` only
+affects the GDB process launched by the dump script.
+
+Development/test wrapper:
+
+```bash
+./tests/dump_aql_queues_with_build_preload.sh --pid 875176
+```
+
+### When to upgrade GDB
+
+Optional troubleshooting only: script `13` has no minimum GDB version
+requirement. Older system GDB builds may print harmless DWARF warnings for
+HIP/CLR libraries built with newer debug info, for example:
+
+```text
+Dwarf Error: DW_FORM_strx1 found in non-DWO CU [in module .../libamdhip64.so.7]
+```
+
+If queue enumeration still succeeds, the dump is usually usable. To remove the
+warning or improve DWARF 5 compatibility, build and use a newer GDB:
+
+```bash
+./00_pull_build_gdb.sh
+export GDB=/path/to/your/gdb-with-python   # path printed by 00_pull_build_gdb.sh
+./13_dump_aql_queues_gdb.sh --pid 875176
+```
+
+Optional persistence in `~/.bashrc` (only if you choose):
+
+```bash
+./00_pull_build_gdb.sh --install-bashrc
+# or manually:
+# export GDB=/path/to/your/gdb-with-python
+```
+
+Notes:
+
+- `/opt/rocm/bin/rocgdb-py3.11` currently crashes when sourcing
+  `aql_packet_decode_gdb.py`; a locally built upstream GDB with Python support
+  is a known workaround.
+- Building GDB requires `python3.11-devel` and other build dependencies.
+- If `GDB` is not set, script `13` defaults to `/usr/bin/gdb` (must support
+  Python); it may fall back to another `gdb` on `PATH` with Python support.
+- `00_pull_build_gdb.sh` never modifies `~/.bashrc` unless you pass
+  `--install-bashrc`.
+
 ## Debug bundle layout
 
 A typical unified collection directory:
@@ -262,11 +412,11 @@ A typical unified collection directory:
 ```text
 gpu_debug_bundle_<HOST>_<TIMESTAMP>/
 ├── queue_doctor/
+├── aql_queue_dump/
 ├── kfd/
 ├── cpc/
 ├── waves/
 ├── sdma-registers.log
-├── amd-smi-process-discovery.log
 ├── system-info.log
 └── collection-summary.tsv
 ```
@@ -283,7 +433,9 @@ and `.tgz` archive.
 - `LOG_FILE`: output path for single-file collectors
 - `AMD_SMI`: path to the `amd-smi` executable
 - `DMESG`: path to the `dmesg` executable
-- `GDB`: optional GDB executable for AQL queue dumps (scripts `06`/`13`)
+- `GDB`: GDB with Python support for `13_dump_aql_queues_gdb.sh` (default: `/usr/bin/gdb`)
+- `GDB_TIMEOUT`: attach/decode timeout for script `13` (default: `120`)
+- `LD_PRELOAD`: optional preload for script `13` or `06` when using debug ROCr
 
 Options differ between scripts. Check the corresponding help before running a
 collector:
@@ -341,24 +493,24 @@ sudo mount -t debugfs none /sys/kernel/debug
 
 ### GDB reports DWARF errors during AQL dump
 
-If queue enumeration still succeeds, the dump is usually valid. To suppress
-DWARF 5 compatibility warnings from older system GDB versions, build and use a
-newer GDB:
+If queue enumeration still succeeds (`Enumerated N queue(s): ...`), the dump is
+usually valid and the message is often a HIP/CLR debug-info compatibility
+warning on older system GDB versions. To suppress it, build and use a newer GDB:
 
 ```bash
 ./00_pull_build_gdb.sh
-export GDB=/path/to/tools/gdb-14.2/bin/gdb
-./13_dump_aql_queues_gdb.sh --pid 875176
+GDB=/path/to/your/gdb-with-python ./13_dump_aql_queues_gdb.sh --pid 875176
 ```
 
-Optional persistence in `~/.bashrc` (only if you choose):
+If enumeration fails together with the DWARF error, verify that the mapped
+`libhsa-runtime64.so` contains `.debug_info` and retry with a GDB that has
+Python support (optionally a newer build from `00_pull_build_gdb.sh`).
 
-```bash
-./00_pull_build_gdb.sh --install-bashrc
-```
+### AQL dump finds no queues
 
-`00_pull_build_gdb.sh` never modifies `~/.bashrc` unless you pass
-`--install-bashrc`.
+Confirm the target PID is still running and, for local debug ROCr builds, set
+`LD_PRELOAD` to the same debug `libhsa-runtime64.so` used by the workload before
+running script `13` or `06`.
 
 ## License
 
