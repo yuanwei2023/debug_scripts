@@ -112,10 +112,20 @@ python3 02_umr_queue_doctor.py \
 或不完整的 UMR 会提前失败并给出可操作的错误提示。需要时可运行
 `./00_pull_build_umr.sh` 构建或更新 UMR，或设置 `UMR=/path/to/newer/umr`。
 
+每个 GPU 对所有已发现的 SDMA block **合并为一次 UMR 批量读取**（`-lb` 仍按
+GPU 单独执行，因为 SDMA block 名称与拓扑相关，且不会跨 GPU 缓存）。跨 GPU
+采集默认同时运行所有已发现的 GPU；可用 `--jobs N` 限制并发数，
+`--jobs 1` 为顺序模式。每次 UMR 调用都有超时（`--timeout` /
+`UMR_TIMEOUT_SEC`，默认 **600** 秒），避免单个 UMR 挂死拖住全局。日志会记录
+并行度、超时、UMR 调用策略/次数，以及每个 GPU worker 的开始/结束时间与耗时。
+
 ```bash
 ./03_dump_sdma_registers.sh
 ./03_dump_sdma_registers.sh --vmp 1 -o /tmp/sdma-registers.log
+./03_dump_sdma_registers.sh --jobs 4 --timeout 900
 ```
+
+离线回归测试：`./tests/run_sdma_register_dump_test.sh`
 
 ### `04_dump_kfd_snapshots.sh`
 

@@ -121,10 +121,23 @@ selected UMR is **>= 1.0.11** and supports the commands this collector uses
 fails early with an actionable error. Build or refresh UMR with
 `./00_pull_build_umr.sh` when needed, or set `UMR=/path/to/newer/umr`.
 
+Each GPU uses **one batched UMR read** for all discovered SDMA blocks on that
+GPU (block discovery via per-GPU `-lb` is still separate because SDMA block
+names are topology-specific and are not cached across GPUs). Cross-GPU
+collection runs concurrently for all discovered GPUs by default; use
+`--jobs N` to limit concurrency or `--jobs 1` for sequential behavior. Each
+UMR invocation has a configurable timeout (`--timeout` / `UMR_TIMEOUT_SEC`,
+default **600** seconds), so a hung UMR cannot block the entire run. The log
+records parallel job count, timeout, UMR invocation strategy/counts, and
+per-GPU worker timings.
+
 ```bash
 ./03_dump_sdma_registers.sh
 ./03_dump_sdma_registers.sh --vmp 1 -o /tmp/sdma-registers.log
+./03_dump_sdma_registers.sh --jobs 4 --timeout 900
 ```
+
+Offline regression tests: `./tests/run_sdma_register_dump_test.sh`
 
 ### `04_dump_kfd_snapshots.sh`
 
