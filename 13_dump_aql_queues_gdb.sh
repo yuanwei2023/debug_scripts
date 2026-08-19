@@ -26,6 +26,11 @@ sourcing aql_packet_decode_gdb.py. This script only performs the gdb dump; it
 does not start workloads or change ROCm/HIP runtime settings. No specific GDB
 version is required or checked.
 
+ROCr debuginfo prerequisite:
+  Install an hsa-rocr-debuginfo RPM whose version exactly matches the
+  installed/mapped hsa-rocr runtime. Example only (use the matching version):
+    sudo dnf install /path/to/hsa-rocr-debuginfo-1.18.0.70204-93.el8.x86_64.rpm
+
 Options:
   --pid PID                 Target process ID (required)
   -o, --output-dir DIR      Output directory (default: timestamped under /tmp)

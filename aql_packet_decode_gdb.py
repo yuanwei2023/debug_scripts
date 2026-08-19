@@ -21,7 +21,10 @@ outfile.write("This extracts kernel names, signal addresses from AQL packets,\n"
 outfile.write("and decodes SDMA (DMA) ring packets.\n")
 outfile.write("Queues are discovered by walking the ROCR runtime singleton\n")
 outfile.write("(no rocgdb 'info queues' / 'info dispatch' commands required;\n")
-outfile.write("librocr debug symbols must be loaded).\n\n")
+outfile.write("matching ROCr debuginfo is required).\n")
+outfile.write("Install an hsa-rocr-debuginfo RPM whose version exactly matches the\n")
+outfile.write("installed/mapped hsa-rocr runtime. Example only (use the matching version):\n")
+outfile.write("  sudo dnf install /path/to/hsa-rocr-debuginfo-1.18.0.70204-93.el8.x86_64.rpm\n\n")
 
 AQL_PACKET_SIZE = 64
 
@@ -193,7 +196,7 @@ def format_signal_info(sig_info, indent="       "):
     lines.append(f"{indent}  start_ts:  {sig_info['start_ts']}"
                  + ("" if sig_info['start_ts'] == 0 else f"  (0x{sig_info['start_ts']:x})"))
     lines.append(f"{indent}  end_ts:    {sig_info['end_ts']}"
-                 + ("" if sig_info['end_ts'] == 0 else f"  (0x{sig_info['end_ts']:x})"))
+                 + ("  [NOT_RECORDED]" if sig_info['end_ts'] == 0 else f"  (0x{sig_info['end_ts']:x})"))
     if sig_info['start_ts'] != 0 and sig_info['end_ts'] != 0 and sig_info['end_ts'] > sig_info['start_ts']:
         dur = sig_info['end_ts'] - sig_info['start_ts']
         lines.append(f"{indent}  duration:  {dur} ns ({dur / 1e6:.3f} ms)")
@@ -820,7 +823,10 @@ def enumerate_runtime_queues():
         rt = gdb.parse_and_eval("'rocr::core::Runtime'::runtime_singleton_")
     except Exception as e:
         outfile.write(f"[enum] cannot read 'rocr::core::Runtime'::runtime_singleton_: {e}\n")
-        outfile.write("       (librocr debug symbols not loaded?)\n\n")
+        outfile.write("       ROCr debuginfo may be missing or mismatched.\n")
+        outfile.write("       Install an hsa-rocr-debuginfo RPM whose version exactly matches the\n")
+        outfile.write("       installed/mapped hsa-rocr runtime. Example only (use the matching version):\n")
+        outfile.write("         sudo dnf install /path/to/hsa-rocr-debuginfo-1.18.0.70204-93.el8.x86_64.rpm\n\n")
         return queues
 
     if int(rt) == 0:
@@ -989,13 +995,38 @@ def enumerate_runtime_queues():
 # ---------------------------------------------------------------------------
 # Per-queue dispatchers
 # ---------------------------------------------------------------------------
-def _write_signal_block(addr, label, indent="       "):
-    """Print 'label: 0xADDR' followed by the full signal struct dump."""
-    outfile.write(f"{indent}{label}: 0x{addr:x}\n")
-    if addr != 0:
-        sig = read_amd_signal(addr)
-        outfile.write(f"{indent}{' ' * len(label)}  signal info:\n")
-        outfile.write(format_signal_info(sig, indent=indent + ' ' * (len(label) + 2)))
+def _write_signal_block(addr, label, indent="       ", zero_note=None):
+    """Print a signal handle and, when nonzero and valid, its decoded state."""
+    outfile.write(f"{indent}{label}: 0x{addr:x}")
+    if addr == 0:
+        if zero_note:
+            outfile.write(f"  [{zero_note}]")
+        outfile.write("\n")
+        return
+
+    outfile.write("\n")
+    info_indent = indent + ' ' * (len(label) + 2)
+    outfile.write(f"{indent}{' ' * len(label)}  signal info:\n")
+
+    # A packet can outlive the signal allocation it refers to. Validate the
+    # handle before formatting it so stale, unmapped, or corrupt packet data
+    # remains diagnostic output rather than aborting the whole GDB script.
+    if addr & (SIGNAL_ALIGNMENT - 1):
+        outfile.write(
+            f"{info_indent}<invalid signal handle: not "
+            f"{SIGNAL_ALIGNMENT}-byte aligned; state unavailable>\n"
+        )
+        return
+
+    offset, signal_base, sig = find_encompassing_signal(addr)
+    if sig is None or offset != 0 or signal_base != addr:
+        outfile.write(
+            f"{info_indent}<invalid, unmapped, or stale signal handle; "
+            f"state unavailable>\n"
+        )
+        return
+
+    outfile.write(format_signal_info(sig, indent=info_indent))
 
 
 # Per-packet-body printers, shared between live and inferred-consumed decoding.
@@ -1022,10 +1053,11 @@ def _print_kernel_dispatch_body(pkt, barrier_bit):
 
 def _print_barrier_body(pkt):
     for j, dep in enumerate(pkt['dep_signals']):
-        if dep != 0:
-            outfile.write(f"       dep[{j}]:     0x{dep:x}\n")
-            sig = read_amd_signal(dep)
-            outfile.write(format_signal_info(sig, indent="         "))
+        _write_signal_block(
+            dep,
+            f"dep_signal[{j}]",
+            zero_note="NONE",
+        )
     _write_signal_block(pkt['completion_signal'], "completion ")
     outfile.write("\n")
 
