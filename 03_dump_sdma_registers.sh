@@ -337,7 +337,7 @@ verify_umr_for_sdma_dump() {
     fail_umr_version "$UMR_VERSION"
   fi
 
-  for token in '--script' '--list-blocks' '-lb' '-vmp' '-O' '-r' '-i'; do
+  for token in '--script' '--list-blocks' '-lb' '--list-regs' '-lr' '-vmp' '-O' '-r' '-i'; do
     if ! grep -qF -- "$token" <<<"$help_text"; then
       missing+=("$token")
     fi
@@ -390,9 +390,11 @@ mkdir -p "$(dirname -- "$LOG_FILE")"
 TOTAL=0
 SUCCESS=0
 FAILED=0
+FILTERED=0
 BLOCKS=0
 DISCOVERY_FAILURES=0
 UMR_LB_INVOCATIONS=0
+UMR_LR_INVOCATIONS=0
 UMR_READ_INVOCATIONS=0
 UMR_TIMED_OUT=0
 AMD_SMI_RC=127
@@ -502,10 +504,13 @@ mapfile -t SORTED_UMR_INSTANCES < <(
   echo "# requested_parallel_jobs=$REQUESTED_JOBS"
   echo "# parallel_jobs=$JOBS"
   echo "# umr_timeout_sec=$UMR_TIMEOUT_SEC"
-  echo "# umr_read_strategy=one_batched_read_per_gpu"
+  echo "# umr_read_strategy=discover_exact_paths_then_one_batched_read_per_gpu"
+  echo "# umr_register_inventory=one_batched_list-regs_per_gpu"
   echo "# requested_register_count=${#REGISTERS[@]}"
   echo "# requested_registers=${REGISTERS[*]}"
-  echo "# UMR register aliases: GFX_RB_PREEMPT=GFX_PREEMPT PAGE_RB_PREEMPT=PAGE_PREEMPT RLC<n>_RB_PREEMPT=RLC<n>_PREEMPT"
+  echo "# register_path_policy=read only exact paths returned by UMR --list-regs"
+  echo "# register_name_policy=accept mm/reg prefixes and optional SDMA engine digits"
+  echo "# UMR logical aliases: GFX_RB_PREEMPT=GFX_PREEMPT PAGE_RB_PREEMPT=PAGE_PREEMPT RLC<n>_RB_PREEMPT=RLC<n>_PREEMPT"
   echo
   echo "# GPU mapping"
   echo "# gpu is KFD/ROCm Node ID; amd_smi_gpu is the GPU number shown by amd-smi."
@@ -530,6 +535,17 @@ mapfile -t SORTED_UMR_INSTANCES < <(
 
 echo "Reading ${#REGISTERS[@]} SDMA registers; log: $LOG_FILE"
 
+normalize_sdma_register_name() {
+  local register_name="${1##*.}"
+  register_name="${register_name#mm}"
+  register_name="${register_name#reg}"
+  if [[ "$register_name" =~ ^SDMA[0-9]*_(.+)$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
 collect_gpu() {
   local umr_instance="$1"
   local partial_file="$2"
@@ -539,10 +555,14 @@ collect_gpu() {
   local bdf="${BDF_BY_UMR[$umr_instance]}"
   local started_ms ended_ms
   local block_list_rc=0 block_list_output=""
+  local inventory_rc=0 inventory_output=""
   local read_rc=0 read_output=""
-  local gpu_total=0 gpu_success=0 gpu_failed=0 gpu_blocks=0
-  local gpu_discovery_failures=0 gpu_timed_out=0 gpu_read_invocations=0
-  local -a sdma_blocks=() umr_args=()
+  local gpu_total=0 gpu_success=0 gpu_failed=0 gpu_filtered=0 gpu_blocks=0
+  local gpu_discovery_failures=0 gpu_timed_out=0
+  local gpu_inventory_invocations=0 gpu_read_invocations=0
+  local -a sdma_blocks=() inventory_args=() umr_args=()
+  local -A inventory_path_by_key=()
+  local -A block_available=() block_filtered=() filtered_names=()
 
   started_ms="$(date +%s%3N)"
   block_list_output="$(run_umr_timed -i "$umr_instance" -lb 2>&1)" || block_list_rc=$?
@@ -568,65 +588,120 @@ collect_gpu() {
     printf '[ERROR] gpu=%s: no SDMA blocks discovered\n\n' "$gpu_id" >>"$partial_file"
   else
     gpu_blocks=${#sdma_blocks[@]}
-    umr_args=(-i "$umr_instance" -vmp "$VMP" -O quiet,bits)
-    local block register umr_register path
+    inventory_args=(-i "$umr_instance" -vmp "$VMP" -O no_backtrace)
+    local block
     for block in "${sdma_blocks[@]}"; do
-      for register in "${REGISTERS[@]}"; do
-        # UMR sdma0445 names PREEMPT without the RB_ infix.
-        umr_register="$register"
-        case "$register" in
-          SDMA_GFX_RB_PREEMPT) umr_register=SDMA_GFX_PREEMPT ;;
-          SDMA_PAGE_RB_PREEMPT) umr_register=SDMA_PAGE_PREEMPT ;;
-          SDMA_RLC[0-7]_RB_PREEMPT)
-            umr_register="${register/_RB_PREEMPT/_PREEMPT}"
-            ;;
-        esac
-        # UMR register paths use the database name (for example
-        # aqua_vanjaram.sdma0445{0}.mmSDMA0_GFX_RB_RPTR), not a synthetic
-        # ".regSDMA_*" prefix. The block instance selects the engine; the
-        # register database keeps the mmSDMA0_ namespace for every instance.
-        path="${block}.mmSDMA0_${umr_register#SDMA_}"
-        umr_args+=(-r "$path")
-      done
+      inventory_args+=(-lr "$block")
+      block_available["$block"]=0
+      block_filtered["$block"]=0
+      filtered_names["$block"]=""
     done
 
-    gpu_total=$((gpu_blocks * ${#REGISTERS[@]}))
-    gpu_read_invocations=1
-    read_output="$(run_umr_timed "${umr_args[@]}" 2>&1)" || read_rc=$?
-    (( read_rc == 124 || read_rc == 137 )) && gpu_timed_out=1
-
+    gpu_inventory_invocations=1
+    inventory_output="$(run_umr_timed "${inventory_args[@]}" 2>&1)" || inventory_rc=$?
+    (( inventory_rc == 124 || inventory_rc == 137 )) && gpu_timed_out=1
     {
-      printf '=== gpu=%s batched-register-read blocks=%d registers_per_block=%d ===\n' \
-        "$gpu_id" "$gpu_blocks" "${#REGISTERS[@]}"
+      printf '=== gpu=%s register-inventory blocks=%d ===\n' "$gpu_id" "$gpu_blocks"
       printf '# command:'
-      printf ' %q' "$UMR" "${umr_args[@]}"
-      printf '\n# exit_code=%d\n' "$read_rc"
-      (( read_rc == 124 || read_rc == 137 )) &&
-        printf '[ERROR] batched register read timed out after %ss\n' "$UMR_TIMEOUT_SEC"
-      printf '%s\n\n' "$read_output"
+      printf ' %q' "$UMR" "${inventory_args[@]}"
+      printf '\n# exit_code=%d\n' "$inventory_rc"
+      (( inventory_rc == 124 || inventory_rc == 137 )) &&
+        printf '[ERROR] register inventory timed out after %ss\n' "$UMR_TIMEOUT_SEC"
+      if (( inventory_rc != 0 )); then
+        printf '%s\n' "$inventory_output"
+      else
+        echo "# inventory_output=parsed; exact selected paths are recorded in the read command"
+      fi
+      echo
     } >>"$partial_file"
 
-    local block_failed block_success
-    for block in "${sdma_blocks[@]}"; do
-      block_failed="$(
-        grep -F "[ERROR]: Path <${block}." <<<"$read_output" | wc -l
-      )"
-      if (( block_failed > ${#REGISTERS[@]} )); then
-        block_failed=${#REGISTERS[@]}
+    if (( inventory_rc != 0 )); then
+      gpu_discovery_failures=1
+      printf '[ERROR] gpu=%s: SDMA register inventory failed\n\n' \
+        "$gpu_id" >>"$partial_file"
+    else
+      local inventory_path inventory_block normalized_name
+      while read -r inventory_path _; do
+        [[ "$inventory_path" == *.*.* ]] || continue
+        inventory_block="${inventory_path%.*}"
+        [[ -n "${block_available[$inventory_block]+present}" ]] || continue
+        normalized_name="$(normalize_sdma_register_name "$inventory_path")" || continue
+        inventory_path_by_key["${inventory_block}|${normalized_name}"]="$inventory_path"
+      done <<<"$inventory_output"
+
+      umr_args=(-i "$umr_instance" -vmp "$VMP" -O quiet,bits,no_backtrace)
+      local register requested_name alias_name selected_path key
+      for block in "${sdma_blocks[@]}"; do
+        for register in "${REGISTERS[@]}"; do
+          requested_name="${register#SDMA_}"
+          selected_path=""
+          key="${block}|${requested_name}"
+          if [[ -n "${inventory_path_by_key[$key]+present}" ]]; then
+            selected_path="${inventory_path_by_key[$key]}"
+          elif [[ "$requested_name" == *_RB_PREEMPT ]]; then
+            alias_name="${requested_name/_RB_PREEMPT/_PREEMPT}"
+            key="${block}|${alias_name}"
+            if [[ -n "${inventory_path_by_key[$key]+present}" ]]; then
+              selected_path="${inventory_path_by_key[$key]}"
+            fi
+          fi
+
+          if [[ -n "$selected_path" ]]; then
+            umr_args+=(-r "$selected_path")
+            (( block_available["$block"] += 1 ))
+            gpu_total=$((gpu_total + 1))
+          else
+            (( block_filtered["$block"] += 1 ))
+            gpu_filtered=$((gpu_filtered + 1))
+            filtered_names["$block"]+="${filtered_names["$block"]:+ }${register}"
+          fi
+        done
+      done
+
+      if (( gpu_total > 0 )); then
+        gpu_read_invocations=1
+        read_output="$(run_umr_timed "${umr_args[@]}" 2>&1)" || read_rc=$?
+        (( read_rc == 124 || read_rc == 137 )) && gpu_timed_out=1
+        {
+          printf '=== gpu=%s batched-register-read blocks=%d selected_registers=%d ===\n' \
+            "$gpu_id" "$gpu_blocks" "$gpu_total"
+          printf '# command:'
+          printf ' %q' "$UMR" "${umr_args[@]}"
+          printf '\n# exit_code=%d\n' "$read_rc"
+          (( read_rc == 124 || read_rc == 137 )) &&
+            printf '[ERROR] batched register read timed out after %ss\n' "$UMR_TIMEOUT_SEC"
+          printf '%s\n\n' "$read_output"
+        } >>"$partial_file"
       fi
-      if (( read_rc != 0 && block_failed == 0 )); then
-        block_failed=${#REGISTERS[@]}
-      fi
-      block_success=$((${#REGISTERS[@]} - block_failed))
-      gpu_success=$((gpu_success + block_success))
-      gpu_failed=$((gpu_failed + block_failed))
-      {
-        printf '=== gpu=%s block=%s registers=%d ===\n' \
-          "$gpu_id" "$block" "${#REGISTERS[@]}"
-        printf 'block_summary: total=%d successful=%d failed=%d umr_rc=%d\n\n' \
-          "${#REGISTERS[@]}" "$block_success" "$block_failed" "$read_rc"
-      } >>"$partial_file"
-    done
+
+      local block_failed block_success available
+      for block in "${sdma_blocks[@]}"; do
+        available="${block_available[$block]}"
+        block_failed="$(
+          grep -F "[ERROR]: Path <${block}." <<<"$read_output" | wc -l
+        )"
+        if (( block_failed > available )); then
+          block_failed=$available
+        fi
+        if (( read_rc != 0 && block_failed == 0 )); then
+          block_failed=$available
+        fi
+        block_success=$((available - block_failed))
+        gpu_success=$((gpu_success + block_success))
+        gpu_failed=$((gpu_failed + block_failed))
+        {
+          printf '=== gpu=%s block=%s requested=%d available=%d filtered=%d ===\n' \
+            "$gpu_id" "$block" "${#REGISTERS[@]}" "$available" \
+            "${block_filtered[$block]}"
+          if (( block_filtered["$block"] > 0 )); then
+            printf 'filtered_registers: %s\n' "${filtered_names[$block]}"
+          fi
+          printf 'block_summary: attempted=%d successful=%d failed=%d filtered=%d umr_rc=%d\n\n' \
+            "$available" "$block_success" "$block_failed" \
+            "${block_filtered[$block]}" "$read_rc"
+        } >>"$partial_file"
+      done
+    fi
   fi
 
   ended_ms="$(date +%s%3N)"
@@ -634,9 +709,11 @@ collect_gpu() {
     printf 'gpu_total=%d\n' "$gpu_total"
     printf 'gpu_success=%d\n' "$gpu_success"
     printf 'gpu_failed=%d\n' "$gpu_failed"
+    printf 'gpu_filtered=%d\n' "$gpu_filtered"
     printf 'gpu_blocks=%d\n' "$gpu_blocks"
     printf 'gpu_discovery_failures=%d\n' "$gpu_discovery_failures"
     printf 'gpu_lb_invocations=1\n'
+    printf 'gpu_inventory_invocations=%d\n' "$gpu_inventory_invocations"
     printf 'gpu_read_invocations=%d\n' "$gpu_read_invocations"
     printf 'gpu_timed_out=%d\n' "$gpu_timed_out"
     printf 'gpu_started_ms=%s\n' "$started_ms"
@@ -698,15 +775,18 @@ for umr_instance in "${SORTED_UMR_INSTANCES[@]}"; do
   {
     printf '# gpu_worker instance=%s started_ms=%s ended_ms=%s elapsed_ms=%d' \
       "$umr_instance" "$gpu_started_ms" "$gpu_ended_ms" "$gpu_elapsed_ms"
-    printf ' lb_invocations=%d read_invocations=%d timed_out=%d\n\n' \
-      "$gpu_lb_invocations" "$gpu_read_invocations" "$gpu_timed_out"
+    printf ' lb_invocations=%d inventory_invocations=%d read_invocations=%d timed_out=%d\n\n' \
+      "$gpu_lb_invocations" "$gpu_inventory_invocations" \
+      "$gpu_read_invocations" "$gpu_timed_out"
   } >>"$LOG_FILE"
   TOTAL=$((TOTAL + gpu_total))
   SUCCESS=$((SUCCESS + gpu_success))
   FAILED=$((FAILED + gpu_failed))
+  FILTERED=$((FILTERED + gpu_filtered))
   BLOCKS=$((BLOCKS + gpu_blocks))
   DISCOVERY_FAILURES=$((DISCOVERY_FAILURES + gpu_discovery_failures))
   UMR_LB_INVOCATIONS=$((UMR_LB_INVOCATIONS + gpu_lb_invocations))
+  UMR_LR_INVOCATIONS=$((UMR_LR_INVOCATIONS + gpu_inventory_invocations))
   UMR_READ_INVOCATIONS=$((UMR_READ_INVOCATIONS + gpu_read_invocations))
   UMR_TIMED_OUT=$((UMR_TIMED_OUT + gpu_timed_out))
   printf 'GPU Node ID %s: AMD-SMI=%s BDF=%s blocks=%d elapsed_ms=%d\n' \
@@ -721,16 +801,18 @@ done
   echo "# gpu_count=${#SORTED_UMR_INSTANCES[@]}"
   echo "# parallel_jobs=$JOBS"
   echo "# umr_timeout_sec=$UMR_TIMEOUT_SEC"
-  echo "# umr_read_strategy=one_batched_read_per_gpu"
+  echo "# umr_read_strategy=discover_exact_paths_then_one_batched_read_per_gpu"
   echo "# umr_lb_invocations=$UMR_LB_INVOCATIONS"
+  echo "# umr_lr_invocations=$UMR_LR_INVOCATIONS"
   echo "# umr_read_invocations=$UMR_READ_INVOCATIONS"
-  echo "# umr_total_invocations=$((UMR_LB_INVOCATIONS + UMR_READ_INVOCATIONS))"
+  echo "# umr_total_invocations=$((UMR_LB_INVOCATIONS + UMR_LR_INVOCATIONS + UMR_READ_INVOCATIONS))"
   echo "# umr_timed_out=$UMR_TIMED_OUT"
   echo "# sdma_block_count=$BLOCKS"
   echo "# discovery_failures=$DISCOVERY_FAILURES"
   echo "# total_reads=$TOTAL"
   echo "# successful_reads=$SUCCESS"
   echo "# failed_reads=$FAILED"
+  echo "# filtered_unavailable=$FILTERED"
 } >>"$LOG_FILE"
 
 # dmesg remains the final section of the log.
@@ -752,8 +834,8 @@ fi
   fi
 } >>"$LOG_FILE"
 
-printf 'Done: total=%d successful=%d failed=%d\nLog: %s\n' \
-  "$TOTAL" "$SUCCESS" "$FAILED" "$LOG_FILE"
+printf 'Done: attempted=%d successful=%d failed=%d filtered=%d\nLog: %s\n' \
+  "$TOTAL" "$SUCCESS" "$FAILED" "$FILTERED" "$LOG_FILE"
 
 if (( SUCCESS == 0 )); then
   exit 1
