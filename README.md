@@ -62,10 +62,17 @@ Specify the target process PID (required):
 ./06_collect_all_gpu_debug.sh --pid 4008481
 ```
 
-Include full retained rings:
+Full physical AQL rings are captured by default. To opt out:
 
 ```bash
-./06_collect_all_gpu_debug.sh --pid 4008481 --full-ring
+./06_collect_all_gpu_debug.sh --pid 4008481 --no-full-ring
+```
+
+Successful raw `.bin` captures are also retained by default. To keep only the
+decoded report after a successful decode:
+
+```bash
+./06_collect_all_gpu_debug.sh --pid 4008481 --discard-full-ring-raw
 ```
 
 The default output directory is:
@@ -99,11 +106,76 @@ The primary queue diagnostic tool. It captures multiple queue snapshots and
 analyzes RPTR/WPTR progress, head packets, pending packets, MQD state, and
 cross-source conflicts.
 
+Each selected AQL queue is dumped in two independent paths by default: the
+current/pending view is written under `pending/`, and an exact
+`hqd_base_addr`/`rb_buf_size` GPUVM read is written under `full-ring/` as a
+raw `.bin` plus a `.decoded.txt` report. UMR reports `rb_buf_size` in
+32-bit words, so Queue Doctor multiplies it by four to obtain the byte capacity.
+The report covers every physical 64-byte slot, including every physical slot
+mapped from the logical pending interval `[RPTR, WPTR)` across wraparound.
+Pending slot headers carry a `[PENDING logical=N]` annotation, and the report
+records the expected/decoded/missing pending-slot sets so omission cannot be
+silent. The UMR-style layout starts with `Dumping ...` and `Decoding IB at ...`
+lines followed by
+`[vmid@base + offset] [raw header] Opcode ... [HSA_*]` packet lines and
+indented `|---> field=value` body/signal lines at their packet-relative byte
+offsets. The decoded text does not duplicate each slot's complete 64-byte
+payload; the exact ring bytes remain in the retained raw `.bin` artifact.
+Queue/HQD/doorbell, RPTR/WPTR, and dispatch metadata remains in the report
+header. It is not JSONL. An INVALID header is always displayed as authoritative
+type `HSA_INVALID`; an internal residual-body interpretation may still decode
+useful subordinate fields, but the decoded text omits the residual-body type
+annotation. These fields never change the header type or claim consumption,
+ownership, or current state. Nonzero barrier dependency handles use bounded,
+cached reads: readable signals show `value` and `status=PENDING|COMPLETED`;
+unreadable signals show only the handle. A zero barrier dependency handle
+means no dependency/already satisfied, so its full-ring text shows only
+`dep_signal[N]=0x0`. Readable nonzero completion/watch signals likewise show
+their value and `PENDING`/`COMPLETED` status; null or unreadable handles show
+only the handle, without unavailable-status or reason lines. Structured slot
+records remain in `report.json`. Both artifacts are retained by default and
+listed in `summary.txt` and `report.json`. Use
+`--discard-full-ring-raw` to delete `.bin` only after successful decode.
+Failed or incomplete decodes always retain available raw data and record the
+reason in the decoded report, even when discard was requested.
+`--keep-full-ring-raw` remains accepted as a backward-compatible, redundant
+spelling of the default policy.
+It records the VM command, exact byte count, SHA-256, exit/timeout/error,
+bounded signal reads, queue-level doorbell/dispatch metadata, and the exact
+PCI, KFD GPU ID, UMR-local queue selector, VM partition/XCC, GFX-hub, and VMID
+context used for the process-GPUVA read. If every pending header is
+authoritatively `HSA_INVALID`, Queue Doctor emits a warning to compare the
+pending dump and verify that context; it does not relabel the packets. Use
+`--no-full-ring` only when capture cost must be avoided. Full-ring failure is
+isolated from pending collection.
+
 ```bash
 python3 02_umr_queue_doctor.py --pid 4008481
 python3 02_umr_queue_doctor.py --pid 4008481 --gpu-id 0 1
 python3 02_umr_queue_doctor.py \
-  --pid 4008481 --queue 28 --samples 3 --interval 10 --full-ring
+  --pid 4008481 --queue 28 --samples 3 --interval 10
+python3 02_umr_queue_doctor.py \
+  --pid 4008481 --discard-full-ring-raw
+```
+
+Queue Doctor keeps the authoritative PID target inventory and selected-GPU
+diagnostics in persisted reports without echoing the verbose source-of-truth,
+per-GPU inventory, or queue-namespace block during a normal standalone
+capture. When invoked through `06_collect_all_gpu_debug.sh`, the inventory
+preflight runs without a visible collector `BEGIN`/`END` section; its output
+remains in `summary.txt` and `collector.txt`, while Queue Doctor also preserves
+the metadata in `target-gpus.json` and `report.json`. GPUs visible to the
+system but absent from the PID's KFD queue inventory remain filtered
+internally and produce no per-GPU output or dump artifacts. A persisted
+inventory header is:
+
+```text
+Target GPUs
+===========
+  AMD-SMI=4 / KFD node=6 / gpu_id=61984 / PCI=0001:0b:00.0 / renderD160 / KFD queues=2 / KFD queue IDs=[41, 77]
+
+Queue Doctor selected GPUs:
+  DUMP AMD-SMI=4 / KFD node=6 / gpu_id=61984 / PCI=0001:0b:00.0 / renderD160
 ```
 
 When `--pid` is omitted, the tool uses `amd-smi` to find
@@ -133,7 +205,7 @@ per-GPU worker timings.
 
 ```bash
 ./03_dump_sdma_registers.sh
-./03_dump_sdma_registers.sh --vmp 1 -o /tmp/sdma-registers.log
+./03_dump_sdma_registers.sh --vmp 1 -o /tmp/sdma-registers.txt
 ./03_dump_sdma_registers.sh --jobs 4 --timeout 900
 ```
 
@@ -161,7 +233,7 @@ rules use `+p`. This script is **not** invoked by `06_collect_all_gpu_debug.sh`.
 ```bash
 ./15_trace_kfd_queue.sh status
 ./15_trace_kfd_queue.sh enable
-./15_trace_kfd_queue.sh capture ./kfd-queue.log
+./15_trace_kfd_queue.sh capture ./kfd-queue.txt
 ./15_trace_kfd_queue.sh disable
 ```
 
@@ -187,6 +259,12 @@ state from every GPU/XCC, then create a `.tgz` archive.
 This script checks and may enable `amdgpu.halt_if_hws_hang`. Use it only in a
 controlled debugging environment.
 
+The CPC collector probes UMR help once and uses the command supported by that
+installation: current UMR releases use `--tool cpc --`, while releases before
+the July 2026 tool-interface change use `--print-cpc`. CPC stdout is saved per
+GPU/XCC; an unsupported interface fails before per-XCC collection instead of
+repeating an unknown-argument warning.
+
 ### `06_collect_all_gpu_debug.sh`
 
 The recommended entry point. It runs Queue Doctor, SDMA, KFD, CPC, and wave
@@ -201,11 +279,38 @@ required; the script does not auto-discover target PIDs.
 
 Use `--skip-queue`, `--skip-sdma`, `--skip-kfd`, `--skip-cpc`,
 `--skip-waves`, or `--skip-aql-queue` to disable individual collectors.
+Successful Queue Doctor `.bin` captures are retained by default.
+`--discard-full-ring-raw` forwards the successful-decode cleanup opt-out.
+The legacy `--keep-full-ring-raw` flag is still forwarded but is redundant.
 
 When enabled, the bundle also includes an AQL/SDMA gdb dump under
 `aql_queue_dump/` (or `aql_queue_dump_pid<PID>/` for multiple targets).
 Optional `GDB` and `LD_PRELOAD` environment variables are forwarded to script
 `13` when you set them before running `06`.
+Queue Doctor keeps its dump directories in the bundle layout and reports final
+status/count diagnostics without printing standalone per-directory path lines.
+
+Every invoked collector, including target inventory and AQL GDB, records
+integer wall-clock execution seconds from a monotonic clock when available.
+Regular visible collector steps and `collector.txt` use these completion
+formats:
+
+```text
+[collector] END queue_doctor: PASS elapsed=12s
+[collector] END cpc_dump: FAIL rc=17; continuing elapsed=3s
+[collector] END aql_queue_dump: FAIL rc=124; continuing elapsed=120s
+```
+
+The target-inventory preflight records its `BEGIN`/`END` and elapsed time only
+in `collector.txt`/`summary.txt`, not in terminal output.
+
+The same `elapsed=<N>s` token is the fourth tab-separated field of each invoked
+step in `summary.txt`; skipped steps use `-`. `total_elapsed=<N>s` and
+`[collector] TOTAL elapsed=<N>s` report the overall wrapper duration, including
+archive creation when enabled. Queue Doctor's nested pending/full-ring timing
+remains independently scoped inside its own artifacts when present: those
+operations are already included in the outer `queue_doctor` elapsed value and
+must not be added to it.
 
 ### `08_dump_all_gpu_waves.sh`
 
@@ -285,10 +390,11 @@ packets, so some discovered handles can already be destroyed and appear as
 
 ### `13_dump_aql_queues_gdb.sh`
 
-Attach GDB to a live process and decode HSA AQL queues plus SDMA blit rings by
-sourcing `aql_packet_decode_gdb.py`. The script only performs the
-attach/decode/detach dump; it does not start workloads or change ROCm runtime
-settings inside the target process.
+Before attaching GDB, capture a bounded, noninteractive snapshot from the exact
+executable `/opt/rocm/bin/amd-smi`. Then attach GDB to a live process and decode
+HSA AQL queues plus SDMA blit rings by sourcing `aql_packet_decode_gdb.py`. The
+script does not start workloads or change ROCm runtime settings inside the
+target process.
 
 Requirements: the selected GDB must be executable and support Python scripting.
 Script `13` does not check or require a minimum or specific GDB version. Default
@@ -304,13 +410,20 @@ Output directory contents:
 ```text
 aql_queue_dump/
 ├── aql_packet_decode_gdb.txt
-└── amd-smi.log
+└── amd-smi-pre-attach.txt
 ```
+
+`amd-smi-pre-attach.txt` contains the attempted command, merged complete
+stdout/stderr, exit codes, timeout, timestamps, and final status. The script
+uses `sudo -n` when not already root and may retry the same absolute executable
+directly after an immediate sudo failure. Missing tools, sudo denial, command
+failure, and timeout are recorded without preventing the GDB dump.
 
 Optional environment variables:
 
 - `GDB`: GDB with Python support (default: `/usr/bin/gdb`)
 - `GDB_TIMEOUT`: attach/decode timeout in seconds (default: `120`)
+- `AMD_SMI_TIMEOUT`: pre-attach `/opt/rocm/bin/amd-smi` timeout (default: `15`)
 - `LD_PRELOAD`: set by the caller when debug ROCr symbols are required
 - `SOLIB_SEARCH_PATH`, `DEBUG_FILE_DIRECTORY`: forwarded to GDB when needed
 
@@ -432,18 +545,41 @@ A typical unified collection directory:
 ```text
 gpu_debug_bundle_<HOST>_<TIMESTAMP>/
 ├── queue_doctor/
+│   ├── target-gpus.json
+│   ├── report.json
+│   ├── pending/
+│   │   └── snapshot-<NN>-queue-<UMR_ID>-<type>.txt
+│   └── full-ring/
+│       ├── snapshot-<NN>-queue-<UMR_ID>-<type>.bin
+│       └── snapshot-<NN>-queue-<UMR_ID>-<type>.decoded.txt
 ├── aql_queue_dump/
 ├── kfd/
 ├── cpc/
 ├── waves/
-├── sdma-registers.log
-├── system-info.log
-└── collection-summary.tsv
+├── sdma_registers.txt
+├── system_info.txt
+├── collector.txt
+├── commands.txt
+└── summary.txt
 ```
 
-The actual layout depends on the enabled collectors, target PIDs, and GPU
-count. Most standalone scripts also produce a command log, error log, summary,
-and `.tgz` archive.
+The `full-ring/` directory and both files are present by default after a
+successful capture and decode. `--discard-full-ring-raw` removes the `.bin`
+after success; `--no-full-ring` disables both full-ring artifacts. For multiple
+selected GPUs, each device has its own Queue Doctor directory with the same
+`pending/` and `full-ring/` layout. The actual layout depends on the enabled
+collectors, target PIDs, and GPU count. Most standalone scripts also produce a
+command log, error log, summary, and `.tgz` archive.
+
+For unified collection, the complete target-GPU inventory is available in the
+bundle `summary.txt` and `collector.txt`; Queue Doctor also writes it to
+`queue_doctor/target-gpus.json` and `queue_doctor/report.json` (or the
+corresponding per-device directory for multi-GPU capture).
+
+The bundle `system_info.txt` records the running kernel, loaded `amdgpu`/KFD
+module metadata from sysfs and `modinfo`, and the complete `dkms status`
+output. Missing modules or commands are recorded with explicit unavailable
+markers instead of failing the collection.
 
 ## Common environment variables
 
@@ -451,10 +587,12 @@ and `.tgz` archive.
 - `UMR`: UMR executable or source directory
 - `OUTPUT_DIR`: output directory for selected collectors
 - `LOG_FILE`: output path for single-file collectors
-- `AMD_SMI`: path to the `amd-smi` executable
+- `AMD_SMI`: preferred path to the `amd-smi` executable; collectors otherwise
+  search `PATH` and standard ROCm install locations such as `/opt/rocm/bin`
 - `DMESG`: path to the `dmesg` executable
 - `GDB`: GDB with Python support for `13_dump_aql_queues_gdb.sh` (default: `/usr/bin/gdb`)
 - `GDB_TIMEOUT`: attach/decode timeout for script `13` (default: `120`)
+- `AMD_SMI_TIMEOUT`: pre-attach `/opt/rocm/bin/amd-smi` timeout (default: `15`)
 - `LD_PRELOAD`: optional preload for script `13` or `06` when using debug ROCr
 
 Options differ between scripts. Check the corresponding help before running a

@@ -154,6 +154,35 @@ if ! UMR_BIN="$(resolve_umr)"; then
   exit 1
 fi
 
+configure_cpc_command() {
+  local help_text
+
+  # UMR moved the standalone --print-cpc/-cpc command under --tool in
+  # bf27a54 (July 2026). Probe once so mixed customer installations use the
+  # syntax they actually advertise without issuing a failed command per XCC.
+  help_text="$("$UMR_BIN" --help 2>&1 || true)"
+  if grep -Eq -- '(^|[[:space:]])--tool([[:space:]]|$)' <<<"$help_text"; then
+    CPC_COMMAND_MODE="tool"
+    CPC_COMMAND_ARGS=(--tool cpc -- -O no_backtrace)
+    return 0
+  fi
+  if grep -Eq -- '(^|[[:space:]])(--print-cpc|-cpc)([[:space:]]|$)' \
+    <<<"$help_text"; then
+    CPC_COMMAND_MODE="legacy"
+    CPC_COMMAND_ARGS=(--print-cpc -O no_backtrace)
+    return 0
+  fi
+
+  echo "UMR help does not advertise a supported CPC diagnostic command" >&2
+  return 1
+}
+
+CPC_COMMAND_MODE=""
+CPC_COMMAND_ARGS=()
+if ! configure_cpc_command; then
+  exit 1
+fi
+
 timestamp="$(date +%Y%m%d_%H%M%S)"
 hostname_short="$(hostname -s 2>/dev/null || hostname)"
 capture_name="${hostname_short}_${timestamp}"
@@ -165,8 +194,8 @@ if ! mkdir -p "$OUTPUT_DIR"; then
   exit 1
 fi
 
-ERROR_LOG="${OUTPUT_DIR}/${capture_name}_errors.log"
-COMMAND_LOG="${OUTPUT_DIR}/${capture_name}_commands.log"
+ERROR_LOG="${OUTPUT_DIR}/${capture_name}_errors.txt"
+COMMAND_LOG="${OUTPUT_DIR}/${capture_name}_commands.txt"
 SUMMARY_LOG="${OUTPUT_DIR}/${capture_name}_summary.txt"
 touch "$ERROR_LOG" "$COMMAND_LOG"
 
@@ -197,6 +226,7 @@ capture_command() {
 }
 
 echo "UMR binary: ${UMR_BIN}"
+echo "UMR CPC command mode: ${CPC_COMMAND_MODE}"
 echo "Output directory: ${OUTPUT_DIR}"
 
 KFD_RLS="/sys/kernel/debug/kfd/rls"
@@ -236,7 +266,7 @@ for gpu_instance in $gpu_list; do
     capture_command \
       "${OUTPUT_DIR}/${capture_name}_umr_cpc_${suffix}.txt" \
       "$UMR_BIN" -i "$gpu_instance" -vmp "$xcc" \
-      -cpc -O no_backtrace || true
+      "${CPC_COMMAND_ARGS[@]}" || true
 
     capture_command \
       "${OUTPUT_DIR}/${capture_name}_umr_waves_${suffix}.txt" \
@@ -269,7 +299,7 @@ for parameter in /sys/module/amdgpu/parameters/*; do
   fi
 done
 
-KERNEL_LOG="${OUTPUT_DIR}/${capture_name}_kernel.log"
+KERNEL_LOG="${OUTPUT_DIR}/${capture_name}_kernel.txt"
 if command -v journalctl >/dev/null 2>&1; then
   capture_command "$KERNEL_LOG" journalctl -b -k || true
 else
@@ -278,6 +308,7 @@ fi
 
 {
   echo "umr=${UMR_BIN}"
+  echo "umr_cpc_command_mode=${CPC_COMMAND_MODE}"
   echo "gpu_count=${gpu_count}"
   echo "gpu_xcc_count=${xcc_count}"
   echo "failures=${failures}"

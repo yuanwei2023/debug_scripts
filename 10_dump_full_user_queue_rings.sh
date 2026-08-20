@@ -244,8 +244,8 @@ if ! mkdir -p "$OUTPUT_DIR"; then
 fi
 OUTPUT_DIR="$(cd -- "$OUTPUT_DIR" && pwd)"
 ARCHIVE_PATH="${OUTPUT_DIR%/}.tgz"
-COMMAND_LOG="${OUTPUT_DIR}/${capture_name}_commands.log"
-ERROR_LOG="${OUTPUT_DIR}/${capture_name}_errors.log"
+COMMAND_LOG="${OUTPUT_DIR}/${capture_name}_commands.txt"
+ERROR_LOG="${OUTPUT_DIR}/${capture_name}_errors.txt"
 SUMMARY_LOG="${OUTPUT_DIR}/${capture_name}_summary.txt"
 QUEUE_MAP="${OUTPUT_DIR}/${capture_name}_queue_map.tsv"
 : >"$COMMAND_LOG"
@@ -318,7 +318,7 @@ log_command() {
 capture_list_uq() {
   local pci_bdf="$1"
   local safe_bdf="${pci_bdf//[:.]/_}"
-  local output_path="${OUTPUT_DIR}/gpu_${safe_bdf}_list_uq.log"
+  local output_path="${OUTPUT_DIR}/gpu_${safe_bdf}_list_uq.txt"
   local command=(
     "$UMR_BIN"
     --by-pci "$pci_bdf"
@@ -382,7 +382,7 @@ for queue_path in "$QUEUE_ROOT"/[0-9]*; do
 
   capture_list_uq "$pci_bdf"
   safe_bdf="${pci_bdf//[:.]/_}"
-  output_path="${OUTPUT_DIR}/gpu_${safe_bdf}_queue_${queue_id}_full_ring.log"
+  output_path="${OUTPUT_DIR}/gpu_${safe_bdf}_queue_${queue_id}_full_ring.txt"
   command=(
     "$UMR_BIN"
     --by-pci "$pci_bdf"

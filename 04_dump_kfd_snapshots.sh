@@ -18,7 +18,7 @@ KFD_DIR="${KFD_DIR:-/sys/kernel/debug/kfd}"
 DRI_DIR="${DRI_DIR:-/sys/kernel/debug/dri}"
 DYNDBG_CTL="${DYNDBG_CTL:-/sys/kernel/debug/dynamic_debug/control}"
 TRACE_ROOT="${TRACE_ROOT:-}"
-AMD_SMI="${AMD_SMI:-$(command -v amd-smi 2>/dev/null || true)}"
+AMD_SMI="${AMD_SMI:-}"
 DMESG="${DMESG:-$(command -v dmesg 2>/dev/null || true)}"
 ENABLE_DYNAMIC_DEBUG="${ENABLE_DYNAMIC_DEBUG:-0}"
 ENABLE_TRACE=1
@@ -61,10 +61,10 @@ Options:
 
 Output:
   kfd-dump-<timestamp>/
-    snapshot_<N>_<timestamp>/{rls,hqds,mqds,amd-smi,dmesg,fence_info}.log
-    trace/drm_sched_dma_fence.log
-    fence_diff.{full,filtered}.log
-    dmesg-final.log
+    snapshot_<N>_<timestamp>/{rls,hqds,mqds,amd-smi,dmesg,fence_info}.txt
+    trace/drm_sched_dma_fence.txt
+    fence_diff.{full,filtered}.txt
+    dmesg-final.txt
     manifest.txt
 
 Environment overrides:
@@ -75,6 +75,45 @@ USAGE
 
 is_positive_integer() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 ))
+}
+
+discover_amd_smi() {
+  local configured="$AMD_SMI"
+  local candidate
+
+  # An explicitly configured executable wins, including paths containing
+  # whitespace. If it is unusable, continue so a stale collector environment
+  # does not hide an installed ROCm executable.
+  if [[ -n "$configured" ]]; then
+    if [[ -x "$configured" ]]; then
+      printf '%s\n' "$configured"
+      return 0
+    fi
+    candidate="$(command -v -- "$configured" 2>/dev/null || true)"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  candidate="$(command -v amd-smi 2>/dev/null || true)"
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  # sudo and non-interactive collectors commonly receive a restricted PATH.
+  for candidate in \
+    /opt/rocm/bin/amd-smi \
+    /usr/local/bin/amd-smi \
+    /usr/bin/amd-smi; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 while (( $# > 0 )); do
@@ -131,6 +170,8 @@ while (( $# > 0 )); do
   esac
 done
 
+AMD_SMI="$(discover_amd_smi || true)"
+
 for value_name in SNAPSHOTS INTERVAL_SEC READ_TIMEOUT_SEC; do
   value="${!value_name}"
   if ! is_positive_integer "$value"; then
@@ -181,9 +222,9 @@ fi
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${OUT_BASE%/}/kfd-dump-${RUN_TS}"
 mkdir -p "$RUN_DIR"
-RUN_LOG="${RUN_DIR}/run.log"
-WARN_LOG="${RUN_DIR}/warnings.log"
-ERROR_LOG="${RUN_DIR}/errors.log"
+RUN_LOG="${RUN_DIR}/run.txt"
+WARN_LOG="${RUN_DIR}/warnings.txt"
+ERROR_LOG="${RUN_DIR}/errors.txt"
 : >"$RUN_LOG"
 : >"$WARN_LOG"
 : >"$ERROR_LOG"
@@ -194,7 +235,7 @@ SUCCESSFUL_CAPTURES=0
 TRACE_INSTANCE=""
 TRACE_ACTIVE=0
 DYNDBG_CHANGED=0
-DYNDBG_BEFORE="${RUN_DIR}/dynamic_debug.before.log"
+DYNDBG_BEFORE="${RUN_DIR}/dynamic_debug.before.txt"
 SNAPSHOT_DIRS=()
 
 now() {
@@ -255,7 +296,7 @@ capture_dmesg() {
   capture_command "$destination" "dmesg" \
     "${ROOT_CMD[@]}" "$DMESG" --color=never --time-format iso
   grep -Ei 'amdgpu|amdkfd|kfd|drm_sched|dma_fence|ih_fifo|timeout|reset|fence' \
-    "$destination" >"${destination%.log}-filtered.log" || true
+    "$destination" >"${destination%.txt}-filtered.txt" || true
 }
 
 capture_fences() {
@@ -397,7 +438,7 @@ start_trace() {
 }
 
 finish_trace() {
-  local destination="${RUN_DIR}/trace/drm_sched_dma_fence.log"
+  local destination="${RUN_DIR}/trace/drm_sched_dma_fence.txt"
 
   [[ -n "$TRACE_INSTANCE" ]] || return 0
   if (( TRACE_ACTIVE == 1 )); then
@@ -445,6 +486,9 @@ fi
 
 log "run_dir=${RUN_DIR}"
 log "snapshots=${SNAPSHOTS} interval=${INTERVAL_SEC}s timeout=${READ_TIMEOUT_SEC}s"
+if [[ -n "$AMD_SMI" ]]; then
+  log "amd_smi=${AMD_SMI}"
+fi
 
 enable_dynamic_debug
 start_trace
@@ -464,18 +508,18 @@ for ((idx = 1; idx <= SNAPSHOTS; idx++)); do
   } >"${SNAP_DIR}/metadata.txt"
 
   for name in "${KFD_FILES[@]}"; do
-    capture_root_file "${KFD_DIR}/${name}" "${SNAP_DIR}/${name}.log" "KFD ${name}"
+    capture_root_file "${KFD_DIR}/${name}" "${SNAP_DIR}/${name}.txt" "KFD ${name}"
   done
 
   if [[ -n "$AMD_SMI" && -x "$AMD_SMI" ]]; then
     # Intentionally run bare amd-smi with no subcommands or flags.
-    capture_command "${SNAP_DIR}/amd-smi.log" "amd-smi" "$AMD_SMI"
+    capture_command "${SNAP_DIR}/amd-smi.txt" "amd-smi" "$AMD_SMI"
   else
     warn "amd-smi is unavailable"
   fi
 
-  capture_fences "${SNAP_DIR}/fence_info.log"
-  capture_dmesg "${SNAP_DIR}/dmesg.log"
+  capture_fences "${SNAP_DIR}/fence_info.txt"
+  capture_dmesg "${SNAP_DIR}/dmesg.txt"
   echo "completed=$(now)" >>"${SNAP_DIR}/metadata.txt"
 
   if (( idx < SNAPSHOTS )); then
@@ -490,29 +534,29 @@ restore_dynamic_debug
 # Compare fence state from the first and last snapshots. With one snapshot,
 # take one additional bounded fence sample after the configured interval.
 if (( ENABLE_FENCE == 1 )) && (( ${#SNAPSHOT_DIRS[@]} > 0 )); then
-  FIRST_FENCE="${SNAPSHOT_DIRS[0]}/fence_info.log"
+  FIRST_FENCE="${SNAPSHOT_DIRS[0]}/fence_info.txt"
   if (( ${#SNAPSHOT_DIRS[@]} == 1 )); then
     log "one snapshot requested; waiting ${INTERVAL_SEC}s for fence comparison"
     sleep "$INTERVAL_SEC"
-    LAST_FENCE="${RUN_DIR}/fence_info_after_${INTERVAL_SEC}s.log"
+    LAST_FENCE="${RUN_DIR}/fence_info_after_${INTERVAL_SEC}s.txt"
     capture_fences "$LAST_FENCE"
   else
     LAST_INDEX=$((${#SNAPSHOT_DIRS[@]} - 1))
-    LAST_FENCE="${SNAPSHOT_DIRS[$LAST_INDEX]}/fence_info.log"
+    LAST_FENCE="${SNAPSHOT_DIRS[$LAST_INDEX]}/fence_info.txt"
   fi
 
   if [[ -f "$FIRST_FENCE" && -f "$LAST_FENCE" ]]; then
     DIFF_RC=0
-    diff -u "$FIRST_FENCE" "$LAST_FENCE" >"${RUN_DIR}/fence_diff.full.log" || DIFF_RC=$?
+    diff -u "$FIRST_FENCE" "$LAST_FENCE" >"${RUN_DIR}/fence_diff.full.txt" || DIFF_RC=$?
     if (( DIFF_RC > 1 )); then
       record_error "fence diff failed (rc=${DIFF_RC})"
     fi
-    grep -E '^[+-].*(signaled|emitted|ring)' "${RUN_DIR}/fence_diff.full.log" \
-      >"${RUN_DIR}/fence_diff.filtered.log" || true
+    grep -E '^[+-].*(signaled|emitted|ring)' "${RUN_DIR}/fence_diff.full.txt" \
+      >"${RUN_DIR}/fence_diff.filtered.txt" || true
   fi
 fi
 
-capture_dmesg "${RUN_DIR}/dmesg-final.log"
+capture_dmesg "${RUN_DIR}/dmesg-final.txt"
 
 {
   echo "run_dir=${RUN_DIR}"

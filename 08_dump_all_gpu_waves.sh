@@ -194,8 +194,8 @@ fi
 OUTPUT_DIR="$(cd -- "$OUTPUT_DIR" && pwd)"
 ARCHIVE_PATH="${OUTPUT_DIR%/}.tgz"
 
-ERROR_LOG="${OUTPUT_DIR}/${capture_name}_errors.log"
-COMMAND_LOG="${OUTPUT_DIR}/${capture_name}_commands.log"
+ERROR_LOG="${OUTPUT_DIR}/${capture_name}_errors.txt"
+COMMAND_LOG="${OUTPUT_DIR}/${capture_name}_commands.txt"
 SUMMARY_LOG="${OUTPUT_DIR}/${capture_name}_summary.txt"
 : >"$ERROR_LOG"
 : >"$COMMAND_LOG"

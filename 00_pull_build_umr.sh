@@ -131,7 +131,7 @@ EOF
   exit 1
 fi
 
-LOG_FILE="${LOG_FILE:-${DEFAULT_LOG_ROOT}/umr_build_$(date +%Y%m%d_%H%M%S).log}"
+LOG_FILE="${LOG_FILE:-${DEFAULT_LOG_ROOT}/umr_build_$(date +%Y%m%d_%H%M%S).txt}"
 mkdir -p -- "$(dirname -- "$LOG_FILE")"
 if command -v tee >/dev/null 2>&1; then
   exec > >(tee -a "$LOG_FILE") 2>&1

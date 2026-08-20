@@ -16,7 +16,7 @@ UMR="${UMR:-}"
 AMD_SMI="${AMD_SMI:-$(command -v amd-smi 2>/dev/null || true)}"
 DMESG="${DMESG:-$(command -v dmesg 2>/dev/null || true)}"
 VMP="${VMP:-1}"
-LOG_FILE="${LOG_FILE:-${DEFAULT_LOG_ROOT}/sdma_registers_$(date +%Y%m%d_%H%M%S).log}"
+LOG_FILE="${LOG_FILE:-${DEFAULT_LOG_ROOT}/sdma_registers_$(date +%Y%m%d_%H%M%S).txt}"
 JOBS="${JOBS:-0}"
 UMR_TIMEOUT_SEC="${UMR_TIMEOUT_SEC:-600}"
 
@@ -91,7 +91,7 @@ by the normal, no-argument amd-smi command. dmesg is appended at the end.
 
 Options:
   -o, --output FILE  Output log path
-                     (default: /tmp/debug-tools-<UID>/sdma_registers_<timestamp>.log)
+                     (default: /tmp/debug-tools-<UID>/sdma_registers_<timestamp>.txt)
       --vmp N        UMR VM partition (default: 1)
       --jobs N       Concurrent per-GPU workers
                      (default: all discovered GPUs; 1 disables concurrency)
@@ -669,7 +669,7 @@ wait_worker_batch() {
 }
 
 for umr_instance in "${SORTED_UMR_INSTANCES[@]}"; do
-  partial_file="${work_dir}/${umr_instance}.log"
+  partial_file="${work_dir}/${umr_instance}.txt"
   stats_file="${work_dir}/${umr_instance}.stats"
   collect_gpu "$umr_instance" "$partial_file" "$stats_file" &
   worker_pids+=("$!")
@@ -683,7 +683,7 @@ done
 
 # Merge per-GPU output in deterministic KFD/ROCm Node ID order.
 for umr_instance in "${SORTED_UMR_INSTANCES[@]}"; do
-  partial_file="${work_dir}/${umr_instance}.log"
+  partial_file="${work_dir}/${umr_instance}.txt"
   stats_file="${work_dir}/${umr_instance}.stats"
   [[ -f "$partial_file" ]] && cat "$partial_file" >>"$LOG_FILE"
   if [[ ! -f "$stats_file" ]]; then

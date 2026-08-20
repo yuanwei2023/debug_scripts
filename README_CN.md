@@ -57,10 +57,16 @@
 ./06_collect_all_gpu_debug.sh --pid 4008481
 ```
 
-采集完整保留 ring：
+默认会采集完整 ring。若需关闭：
 
 ```bash
-./06_collect_all_gpu_debug.sh --pid 4008481 --full-ring
+./06_collect_all_gpu_debug.sh --pid 4008481 --no-full-ring
+```
+
+成功采集的 raw `.bin` 也会默认保留。若成功解码后只保留 decoded report：
+
+```bash
+./06_collect_all_gpu_debug.sh --pid 4008481 --discard-full-ring-raw
 ```
 
 默认输出到：
@@ -92,11 +98,61 @@ DEBUG_TOOLS_TMP_DIR=/var/tmp/gpu-debug \
 核心 Queue 诊断工具。采集多次 Queue 快照并分析 RPTR/WPTR 是否推进、
 head packet、pending packet、MQD 状态和数据源冲突。
 
+默认 full-ring 会同时保留 raw `.bin` 和 `.decoded.txt`。UMR 的
+`rb_buf_size` 单位是 32-bit word，Queue Doctor 会乘以 4 得到 ring 的 byte
+容量；后者扫描每个物理 64-byte slot，并明确覆盖逻辑 pending 区间
+`[RPTR, WPTR)`（包括 wraparound）映射到的所有物理 slot。pending slot 的
+header 带有 `[PENDING logical=N]` 标记，报告同时记录预期、已解码和缺失的
+pending slot，避免静默遗漏。输出采用与 pending dump 一致的 UMR 风格：先输出
+`Dumping ...`、`Decoding IB at ...`，再按
+`[vmid@base + offset] [raw header] Opcode ... [HSA_*]` 输出 packet，
+body/signal 字段使用带 packet 内相对 byte offset 的 `|---> field=value`
+缩进。decoded text 不再重复显示每个 slot 的完整 64-byte payload；精确 ring
+bytes 仍保留在 raw `.bin` 产物中。Queue/HQD/doorbell、RPTR/WPTR 和 dispatch
+元数据仍保留在 report header。文本不使用 JSONL。
+header 类型为 INVALID 时，主 packet 类型始终显示为权威的 `HSA_INVALID`；
+内部残留 body 启发式解析仍可解码有用的下级字段，但 decoded text 不显示残留
+body 类型注释。这些字段不改变 header 类型，也不声称 packet 已消费、归属或
+处于当前状态。非零 barrier dependency handle 使用有界、缓存的读取：可读时
+显示 `value` 和 `status=PENDING|COMPLETED`；不可读时只显示
+handle。值为零的 barrier dependency handle 表示无依赖或已满足，所以 full-ring
+文本只显示 `dep_signal[N]=0x0`。可读的非零 completion/watch signal 同样显示
+value 和 `PENDING`/`COMPLETED` status；handle 为空或不可读时只显示 handle，
+不显示 unavailable status 或 reason 行。结构化 slot 数据保留在 `report.json`。
+`summary.txt` 和 `report.json` 会列出这两个产物及保留策略。使用
+`--discard-full-ring-raw` 时，仅在成功解码后删除 `.bin`。即使指定该选项，
+解码失败或不完整时仍会保留已有 raw data，并在 decoded report 中记录原因。
+`--keep-full-ring-raw` 为向后兼容继续接受，但与默认行为相同，无需再指定。
+报告还会记录 GPU PCI、KFD gpu_id、UMR-local queue selector、VM
+partition/XCC、GFX hub 和 VMID 上下文。如果 pending 区间的所有权威 header
+都是 `HSA_INVALID`，工具会提示对照 pending dump 并检查这些上下文，但不会为了
+满足覆盖要求而重命名 packet 类型。
+
 ```bash
 python3 02_umr_queue_doctor.py --pid 4008481
 python3 02_umr_queue_doctor.py --pid 4008481 --gpu-id 0 1
 python3 02_umr_queue_doctor.py \
-  --pid 4008481 --queue 28 --samples 3 --interval 10 --full-ring
+  --pid 4008481 --queue 28 --samples 3 --interval 10
+python3 02_umr_queue_doctor.py \
+  --pid 4008481 --discard-full-ring-raw
+```
+
+Queue Doctor 会在持久化报告中保留权威的 PID 目标 GPU inventory 和已选择 GPU
+诊断信息，但正常独立采集时不再向终端输出冗长的 source-of-truth、逐 GPU
+inventory 或 Queue namespace 区块。通过 `06_collect_all_gpu_debug.sh` 集成
+运行时，inventory 预检不会产生可见的 collector `BEGIN`/`END` 区块；其输出仍
+写入 `summary.txt` 和 `collector.txt`，Queue Doctor 也会在
+`target-gpus.json` 和 `report.json` 中保留这些元数据。系统可见但不在该 PID
+的 KFD Queue inventory 中的 GPU 仍会在内部过滤，不产生逐 GPU 输出或 dump
+文件。持久化的 inventory 开头如下：
+
+```text
+Target GPUs
+===========
+  AMD-SMI=4 / KFD node=6 / gpu_id=61984 / PCI=0001:0b:00.0 / renderD160 / KFD queues=2 / KFD queue IDs=[41, 77]
+
+Queue Doctor selected GPUs:
+  DUMP AMD-SMI=4 / KFD node=6 / gpu_id=61984 / PCI=0001:0b:00.0 / renderD160
 ```
 
 未指定 `--pid` 时，默认通过 `amd-smi` 查找 `torch_server.bin`。
@@ -121,7 +177,7 @@ GPU 单独执行，因为 SDMA block 名称与拓扑相关，且不会跨 GPU �
 
 ```bash
 ./03_dump_sdma_registers.sh
-./03_dump_sdma_registers.sh --vmp 1 -o /tmp/sdma-registers.log
+./03_dump_sdma_registers.sh --vmp 1 -o /tmp/sdma-registers.txt
 ./03_dump_sdma_registers.sh --jobs 4 --timeout 900
 ```
 
@@ -148,7 +204,7 @@ journal。eviction worker 函数规则使用 `+pfl`，其余规则使用 `+p`。
 ```bash
 ./15_trace_kfd_queue.sh status
 ./15_trace_kfd_queue.sh enable
-./15_trace_kfd_queue.sh capture ./kfd-queue.log
+./15_trace_kfd_queue.sh capture ./kfd-queue.txt
 ./15_trace_kfd_queue.sh disable
 ```
 
@@ -173,6 +229,11 @@ journal。eviction worker 函数规则使用 `+pfl`，其余规则使用 `+p`。
 
 该脚本会检查并可能启用 `amdgpu.halt_if_hws_hang`。仅应在受控调试环境使用。
 
+CPC collector 只探测一次 UMR help，并按安装版本选择命令：当前 UMR 使用
+`--tool cpc --`，2026 年 7 月 tool interface 变更前的版本使用
+`--print-cpc`。每个 GPU/XCC 的 CPC stdout 都会写入文件；若接口不受支持，
+脚本会在逐 XCC 采集前失败，不会重复刷 unknown-argument warning。
+
 ### `06_collect_all_gpu_debug.sh`
 
 推荐入口。按顺序运行 Queue Doctor、SDMA、KFD、CPC 和 Wave collector，
@@ -186,10 +247,35 @@ journal。eviction worker 函数规则使用 `+pfl`，其余规则使用 `+p`。
 
 可使用 `--skip-queue`、`--skip-sdma`、`--skip-kfd`、`--skip-cpc`、
 `--skip-waves` 或 `--skip-aql-queue` 禁用单项采集。
+Queue Doctor 成功采集的 `.bin` 默认保留；`--discard-full-ring-raw` 会向
+Queue Doctor 传递成功解码后删除 raw 的选项。旧的
+`--keep-full-ring-raw` 仍会转发，但与默认行为相同。
 
 启用后会额外生成 AQL/SDMA gdb dump，保存在 `aql_queue_dump/`（多 PID 时为
 `aql_queue_dump_pid<PID>/`）。如需自定义 GDB 或 preload，请在运行 `06` 前
 自行 `export GDB=...` 或 `export LD_PRELOAD=...`。
+Queue Doctor 仍会按 bundle 结构创建 dump 目录，并保留最终状态/数量诊断，
+但不会单独打印每个目录的路径行。
+
+每个实际调用的 collector（包括目标 inventory 和 AQL GDB）都会记录整数秒耗时；
+环境支持时使用单调时钟。普通可见 collector 步骤和 `collector.txt` 使用以下
+固定完成格式：
+
+```text
+[collector] END queue_doctor: PASS elapsed=12s
+[collector] END cpc_dump: FAIL rc=17; continuing elapsed=3s
+[collector] END aql_queue_dump: FAIL rc=124; continuing elapsed=120s
+```
+
+目标 inventory 预检的 `BEGIN`/`END` 和耗时只记录在
+`collector.txt`/`summary.txt`，不输出到终端。
+
+`summary.txt` 中每个已调用步骤的第 4 个制表符分隔字段会保存相同的
+`elapsed=<N>s`；跳过的步骤使用 `-`。`total_elapsed=<N>s` 和
+`[collector] TOTAL elapsed=<N>s` 记录整个 wrapper 的总耗时，启用归档时包含
+归档创建时间。Queue Doctor 已有的 pending/full-ring 内层耗时仍独立保存在其
+自身产物中（如有）；这些操作已经包含在外层 `queue_doctor` 耗时里，不应再次
+相加。
 
 ### `08_dump_all_gpu_waves.sh`
 
@@ -264,9 +350,10 @@ signal。`--full-ring` 还会扫描历史保留 packet，因此部分 handle 可
 
 ### `13_dump_aql_queues_gdb.sh`
 
-Attach 普通 GDB 到 live 进程，通过 `aql_packet_decode_gdb.py` 解码 HSA AQL
-queue 和 SDMA blit ring。该脚本只负责 attach/decode/detach，不会启动
-workload，也不会修改目标进程内的 ROCm 运行时环境。
+Attach GDB 前，先对固定可执行文件 `/opt/rocm/bin/amd-smi` 进行有超时、
+非交互式采集；然后 Attach 普通 GDB 到 live 进程，通过
+`aql_packet_decode_gdb.py` 解码 HSA AQL queue 和 SDMA blit ring。该脚本
+不会启动 workload，也不会修改目标进程内的 ROCm 运行时环境。
 
 要求：所选 GDB 必须可执行且支持 Python 脚本。脚本 `13` 不检查、也不要求
 最低或特定 GDB 版本。默认 `/usr/bin/gdb`；可用 `GDB` 或 `--gdb` 覆盖。
@@ -281,13 +368,19 @@ workload，也不会修改目标进程内的 ROCm 运行时环境。
 ```text
 aql_queue_dump/
 ├── aql_packet_decode_gdb.txt
-└── amd-smi.log
+└── amd-smi-pre-attach.txt
 ```
+
+`amd-smi-pre-attach.txt` 包含尝试执行的命令、合并后的完整 stdout/stderr、
+退出码、超时、时间戳和最终状态。非 root 用户使用 `sudo -n`；sudo 立即失败
+时，可以直接重试同一个绝对路径。工具缺失、sudo 拒绝、命令失败或超时都会被
+记录，但不会阻止后续 GDB dump。
 
 可选环境变量：
 
 - `GDB`：支持 Python 的 GDB（默认：`/usr/bin/gdb`）
 - `GDB_TIMEOUT`：attach/decode 超时秒数（默认：`120`）
+- `AMD_SMI_TIMEOUT`：attach 前 `/opt/rocm/bin/amd-smi` 超时（默认：`15`）
 - `LD_PRELOAD`：需要 debug ROCr 符号时由调用方自行设置
 - `SOLIB_SEARCH_PATH`、`DEBUG_FILE_DIRECTORY`：按需传给 GDB
 
@@ -405,17 +498,37 @@ export GDB=/path/to/your/gdb-with-python   # 路径由 00_pull_build_gdb.sh 打�
 ```text
 gpu_debug_bundle_<HOST>_<TIMESTAMP>/
 ├── queue_doctor/
+│   ├── target-gpus.json
+│   ├── report.json
+│   ├── pending/
+│   │   └── snapshot-<NN>-queue-<UMR_ID>-<type>.txt
+│   └── full-ring/（默认启用）
+│       ├── snapshot-<NN>-queue-<UMR_ID>-<type>.bin
+│       └── snapshot-<NN>-queue-<UMR_ID>-<type>.decoded.txt
 ├── aql_queue_dump/
 ├── kfd/
 ├── cpc/
 ├── waves/
-├── sdma-registers.log
-├── system-info.log
-└── collection-summary.tsv
+├── sdma_registers.txt
+├── system_info.txt
+├── collector.txt
+├── commands.txt
+└── summary.txt
 ```
 
-实际目录会根据启用的 collector、目标 PID 和 GPU 数量变化。大部分独立脚本还会
-生成 command log、error log、summary 和 `.tgz` 归档。
+成功采集并解码后，`full-ring/` 默认同时包含 `.bin` 和 `.decoded.txt`。
+`--discard-full-ring-raw` 会在成功时删除 `.bin`，`--no-full-ring` 会关闭这两类
+full-ring 产物。实际目录会根据启用的 collector、目标 PID 和 GPU 数量变化。
+大部分独立脚本还会生成 command log、error log、summary 和 `.tgz` 归档。
+
+一键采集时，完整目标 GPU inventory 可在 bundle 根目录的 `summary.txt` 和
+`collector.txt` 中查看；Queue Doctor 还会写入
+`queue_doctor/target-gpus.json` 和 `queue_doctor/report.json`（多 GPU 时查看
+对应的设备目录）。
+
+bundle 中的 `system_info.txt` 会记录当前内核、从 sysfs 和 `modinfo` 获取的
+已加载 `amdgpu`/KFD 模块信息，以及完整的 `dkms status` 输出。模块或命令
+不存在时会写入明确的 unavailable 标记，不会导致采集失败。
 
 ## 常用环境变量
 
@@ -423,10 +536,12 @@ gpu_debug_bundle_<HOST>_<TIMESTAMP>/
 - `UMR`：UMR 可执行文件或源码目录
 - `OUTPUT_DIR`：部分 collector 的输出目录
 - `LOG_FILE`：单文件 collector 的输出路径
-- `AMD_SMI`：`amd-smi` 可执行文件路径
+- `AMD_SMI`：优先使用的 `amd-smi` 可执行文件路径；未配置时会继续搜索
+  `PATH` 和 `/opt/rocm/bin` 等标准 ROCm 安装位置
 - `DMESG`：`dmesg` 可执行文件路径
 - `GDB`：脚本 `13` 使用的 GDB（须支持 Python；默认：`/usr/bin/gdb`）
 - `GDB_TIMEOUT`：脚本 `13` 的 attach/decode 超时（默认：`120`）
+- `AMD_SMI_TIMEOUT`：attach 前 `/opt/rocm/bin/amd-smi` 超时（默认：`15`）
 - `LD_PRELOAD`：使用 debug ROCr 时，运行脚本 `13` 或 `06` 前可选设置
 
 每个脚本的参数可能不同，请优先查看对应帮助：

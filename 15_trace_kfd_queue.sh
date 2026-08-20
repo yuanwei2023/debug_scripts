@@ -39,7 +39,7 @@ disable  Turn them off (module params back to default 0).
 status   Show module params and how many callsites are enabled per file.
 capture  enable, then tee the kernel journal into LOG until Ctrl-C.
          Debug stays enabled afterwards; run "disable" explicitly.
-         Default LOG: ./kfd-queue-<timestamp>.log
+         Default LOG: ./kfd-queue-<timestamp>.txt
 USAGE
 }
 
@@ -100,7 +100,7 @@ case ${1-capture} in
     -h | --help) usage ;;
     capture | *)
         [[ ${1-} == capture ]] && shift
-        log=${1:-kfd-queue-$(date +%Y%m%d-%H%M%S).log}
+        log=${1:-kfd-queue-$(date +%Y%m%d-%H%M%S).txt}
         apply 1
         printf 'Logging to %s (Ctrl-C stops capture; debug stays on)\n' "$log"
         sudo journalctl -k -f -n0 -o short-monotonic --no-pager |

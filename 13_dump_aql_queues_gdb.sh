@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Attach plain gdb to a live process and dump AQL/SDMA queue state via
-# aql_packet_decode_gdb.py. Does not modify the target runtime environment.
+# Capture fixed-path amd-smi state, then attach plain gdb to a live process and
+# dump AQL/SDMA queues via aql_packet_decode_gdb.py. Does not modify the target.
 
 set -Eeuo pipefail
 
@@ -13,6 +13,8 @@ OUTPUT_DIR=""
 OUTPUT_FILE=""
 GDB_BIN="${GDB:-/usr/bin/gdb}"
 GDB_TIMEOUT="${GDB_TIMEOUT:-120}"
+AMD_SMI_BIN="/opt/rocm/bin/amd-smi"
+AMD_SMI_TIMEOUT="${AMD_SMI_TIMEOUT:-15}"
 NO_SUDO=0
 SOLIB_SEARCH_PATH="${SOLIB_SEARCH_PATH:-}"
 DEBUG_FILE_DIRECTORY="${DEBUG_FILE_DIRECTORY:-}"
@@ -21,10 +23,11 @@ usage() {
   cat <<'EOF'
 Usage: ./13_dump_aql_queues_gdb.sh [options]
 
-Attach GDB with Python support to a live process and decode HSA/SDMA queues by
-sourcing aql_packet_decode_gdb.py. This script only performs the gdb dump; it
-does not start workloads or change ROCm/HIP runtime settings. No specific GDB
-version is required or checked.
+Capture /opt/rocm/bin/amd-smi, then attach GDB with Python support to a live
+process and decode HSA/SDMA queues by sourcing aql_packet_decode_gdb.py. The
+amd-smi snapshot is bounded and completes before any debugger attach. This
+script does not start workloads or change ROCm/HIP runtime settings. No
+specific GDB version is required or checked.
 
 ROCr debuginfo prerequisite:
   Install an hsa-rocr-debuginfo RPM whose version exactly matches the
@@ -52,8 +55,8 @@ Equivalent manual command:
     -ex "detach"
 
 Environment:
-  GDB, GDB_TIMEOUT, SOLIB_SEARCH_PATH, DEBUG_FILE_DIRECTORY,
-  DEBUG_TOOLS_TMP_DIR, AQL_PACKET_DECODE_OUTPUT
+  GDB, GDB_TIMEOUT, AMD_SMI_TIMEOUT (default: 15), SOLIB_SEARCH_PATH,
+  DEBUG_FILE_DIRECTORY, DEBUG_TOOLS_TMP_DIR, AQL_PACKET_DECODE_OUTPUT
 EOF
 }
 
@@ -98,6 +101,147 @@ select_gdb() {
     return 0
   fi
   return 1
+}
+
+run_amd_smi_attempt() {
+  local attempt="$1"
+  shift
+  local rc
+
+  {
+    printf '# attempt.%s.command: ' "$attempt"
+    printf '%q ' "$@"
+    printf '\n# attempt.%s.stdout_stderr_begin\n' "$attempt"
+  } >>"$amd_smi_log"
+
+  set +e
+  {
+    "$@"
+  } >>"$amd_smi_log" 2>&1
+  rc=$?
+  set -e
+
+  {
+    printf '\n# attempt.%s.stdout_stderr_end\n' "$attempt"
+    printf '# attempt.%s.exit_code: %s\n' "$attempt" "$rc"
+  } >>"$amd_smi_log"
+  AMD_SMI_ATTEMPT_RC="$rc"
+}
+
+capture_amd_smi_pre_attach() {
+  local timeout_bin=""
+  local sudo_bin=""
+  local primary_rc=""
+  local fallback_rc=""
+  local status=""
+  local -a timeout_prefix=()
+
+  amd_smi_log="${OUTPUT_DIR}/amd-smi-pre-attach.txt"
+  {
+    echo "# artifact: amd-smi snapshot before GDB attach"
+    echo "# captured_at: $(date -Is 2>/dev/null || date)"
+    echo "# executable: ${AMD_SMI_BIN}"
+    echo "# requested_command: sudo -n -- ${AMD_SMI_BIN}"
+    echo "# timeout_seconds: ${AMD_SMI_TIMEOUT}"
+    echo "# effective_uid: ${EUID}"
+  } >"$amd_smi_log"
+
+  if [[ ! "$AMD_SMI_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    status="invalid-timeout"
+    {
+      echo "# status: ${status}"
+      echo "# exit_code: not-run"
+      echo "# error: AMD_SMI_TIMEOUT must be a positive integer"
+      echo "# completed_at: $(date -Is 2>/dev/null || date)"
+    } >>"$amd_smi_log"
+    log "amd-smi pre-attach: ${status}; ${amd_smi_log}"
+    return 0
+  fi
+
+  if [[ ! -x "$AMD_SMI_BIN" ]]; then
+    status="missing"
+    {
+      echo "# status: ${status}"
+      echo "# exit_code: 127"
+      echo "# error: executable is missing or not executable: ${AMD_SMI_BIN}"
+      echo "# completed_at: $(date -Is 2>/dev/null || date)"
+    } >>"$amd_smi_log"
+    log "amd-smi pre-attach: ${status}; ${amd_smi_log}"
+    return 0
+  fi
+
+  timeout_bin="$(command -v timeout 2>/dev/null || true)"
+  if [[ -z "$timeout_bin" ]]; then
+    status="timeout-unavailable"
+    {
+      echo "# status: ${status}"
+      echo "# exit_code: 127"
+      echo "# error: timeout command unavailable; amd-smi was not run unbounded"
+      echo "# completed_at: $(date -Is 2>/dev/null || date)"
+    } >>"$amd_smi_log"
+    log "amd-smi pre-attach: ${status}; ${amd_smi_log}"
+    return 0
+  fi
+  # Do not use timeout --foreground here: amd-smi is noninteractive, and a
+  # separate process group ensures sudo's descendants are bounded as well.
+  timeout_prefix=("$timeout_bin" -k 2s "${AMD_SMI_TIMEOUT}s")
+
+  if ((EUID == 0)); then
+    run_amd_smi_attempt "root" "${timeout_prefix[@]}" "$AMD_SMI_BIN"
+    primary_rc="$AMD_SMI_ATTEMPT_RC"
+    if ((primary_rc == 0)); then
+      status="success"
+    elif ((primary_rc == 124 || primary_rc == 137)); then
+      status="timeout"
+    else
+      status="failed"
+    fi
+  else
+    sudo_bin="$(command -v sudo 2>/dev/null || true)"
+    if [[ -n "$sudo_bin" ]]; then
+      run_amd_smi_attempt \
+        "sudo" "${timeout_prefix[@]}" "$sudo_bin" -n -- "$AMD_SMI_BIN"
+      primary_rc="$AMD_SMI_ATTEMPT_RC"
+      if ((primary_rc == 0)); then
+        status="success"
+      elif ((primary_rc == 124 || primary_rc == 137)); then
+        status="timeout"
+      else
+        # Bare amd-smi with no arguments is read-only. A direct retry is safe
+        # after an immediate sudo failure, but not after a possible tool hang.
+        run_amd_smi_attempt \
+          "direct_fallback" "${timeout_prefix[@]}" "$AMD_SMI_BIN"
+        fallback_rc="$AMD_SMI_ATTEMPT_RC"
+        if ((fallback_rc == 0)); then
+          status="sudo-failed-direct-succeeded"
+        elif ((fallback_rc == 124 || fallback_rc == 137)); then
+          status="sudo-failed-direct-timeout"
+        else
+          status="sudo-failed-direct-failed"
+        fi
+      fi
+    else
+      run_amd_smi_attempt \
+        "direct_fallback" "${timeout_prefix[@]}" "$AMD_SMI_BIN"
+      fallback_rc="$AMD_SMI_ATTEMPT_RC"
+      if ((fallback_rc == 0)); then
+        status="sudo-missing-direct-succeeded"
+      elif ((fallback_rc == 124 || fallback_rc == 137)); then
+        status="sudo-missing-direct-timeout"
+      else
+        status="sudo-missing-direct-failed"
+      fi
+    fi
+  fi
+
+  {
+    [[ -n "$primary_rc" ]] && echo "# primary_exit_code: ${primary_rc}"
+    [[ -n "$fallback_rc" ]] && echo "# fallback_exit_code: ${fallback_rc}"
+    echo "# status: ${status}"
+    echo "# completed_at: $(date -Is 2>/dev/null || date)"
+  } >>"$amd_smi_log"
+  log "amd-smi pre-attach: ${status}; ${amd_smi_log}"
+  return 0
 }
 
 while (($# > 0)); do
@@ -210,22 +354,11 @@ else
   OUTPUT_DIR="$(dirname -- "$OUTPUT_FILE")"
 fi
 
-amd_smi_log="${OUTPUT_DIR}/amd-smi.log"
-amd_smi_bin="${AMD_SMI:-$(command -v amd-smi 2>/dev/null || true)}"
-{
-  echo "# captured: $(date -Is 2>/dev/null || date)"
-  echo "# command: amd-smi"
-  echo
-  if [[ -n "${amd_smi_bin}" && -x "${amd_smi_bin}" ]]; then
-    "${amd_smi_bin}" 2>&1 || echo "[ERROR] amd-smi exited $?"
-  else
-    echo "[ERROR] amd-smi unavailable"
-  fi
-} >"${amd_smi_log}"
-log "amd-smi: ${amd_smi_log}"
+# This must remain before select_gdb and all construction/execution of `gdb -p`.
+capture_amd_smi_pre_attach
 
 tmp_output="${OUTPUT_DIR}/.aql_packet_decode_gdb.${PID}.$$.tmp"
-gdb_log="${OUTPUT_DIR}/.aql_packet_decode_gdb.${PID}.$$.gdb.log"
+gdb_log="${OUTPUT_DIR}/.aql_packet_decode_gdb.${PID}.$$.gdb.txt"
 cleanup() {
   rm -f -- "${tmp_output}" "${gdb_log}"
 }

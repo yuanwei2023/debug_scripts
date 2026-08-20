@@ -1,30 +1,26 @@
 import gdb
 import os
+import shlex
 import struct
 
-_script_file = globals().get("__file__")
-_default_output_dir = (
-    os.path.dirname(os.path.abspath(_script_file))
-    if _script_file
+script_file = globals().get("__file__")
+default_output_dir = (
+    os.path.dirname(os.path.abspath(script_file))
+    if script_file
     else os.getcwd()
 )
-_output_path = os.environ.get(
+output_path = os.environ.get(
     "AQL_PACKET_DECODE_OUTPUT",
-    os.path.join(_default_output_dir, "aql_packet_decode_gdb.txt"),
+    os.path.join(default_output_dir, "aql_packet_decode_gdb.txt"),
 )
-_display_output_path = os.environ.get(
-    "AQL_PACKET_DECODE_DISPLAY_OUTPUT", _output_path
-)
-outfile = open(_output_path, 'w')
+display_output_path = os.environ.get("AQL_PACKET_DECODE_DISPLAY_OUTPUT", output_path)
+outfile = open(output_path, 'w')
 outfile.write("=== AQL + SDMA Packet Decode via plain gdb ===\n")
 outfile.write("This extracts kernel names, signal addresses from AQL packets,\n")
 outfile.write("and decodes SDMA (DMA) ring packets.\n")
 outfile.write("Queues are discovered by walking the ROCR runtime singleton\n")
 outfile.write("(no rocgdb 'info queues' / 'info dispatch' commands required;\n")
-outfile.write("matching ROCr debuginfo is required).\n")
-outfile.write("Install an hsa-rocr-debuginfo RPM whose version exactly matches the\n")
-outfile.write("installed/mapped hsa-rocr runtime. Example only (use the matching version):\n")
-outfile.write("  sudo dnf install /path/to/hsa-rocr-debuginfo-1.18.0.70204-93.el8.x86_64.rpm\n\n")
+outfile.write("DWARF types for ROCr's libhsa-runtime64.so must be loaded).\n\n")
 
 AQL_PACKET_SIZE = 64
 
@@ -124,6 +120,69 @@ VALID_SIGNAL_KINDS = {0, 1, -1, -2}
 # so every signal allocation is 64-byte aligned. We use this to recover the
 # signal base from any address that falls inside it.
 SIGNAL_ALIGNMENT = 64
+queue_enum_failure = None
+enumerated_queue_count = 0
+
+
+def _objfiles():
+    """Return objfiles in the current program space."""
+    try:
+        return list(gdb.current_progspace().objfiles())
+    except Exception:
+        return list(gdb.objfiles())
+
+
+def _find_rocr_objfile():
+    """Return the loaded objfile implementing ROCr, if any.
+
+    ROCr is libhsa-runtime64.so; there is no separate librocr shared library.
+    """
+    for objfile in _objfiles():
+        name = objfile.filename or ""
+        if os.path.basename(name).startswith("libhsa-runtime64.so"):
+            return objfile
+    return None
+
+
+def prepare_debugger_context():
+    """Validate the inferior and objfiles before touching process memory.
+
+    The wrapper normally supplies the executable before attach.  If this
+    script is sourced manually after attach and GDB has no objfiles, recover
+    the executable from /proc/PID/exe and ask GDB to load shared libraries.
+    """
+    try:
+        inferior = gdb.selected_inferior()
+        pid = int(inferior.pid)
+    except Exception as exc:
+        outfile.write(f"[preflight] ERROR: no selected inferior: {exc}\n")
+        outfile.write("            Use `file EXECUTABLE`, then `attach PID`, then source this script.\n\n")
+        return False
+
+    if pid <= 0 or not inferior.threads():
+        outfile.write("[preflight] ERROR: no live inferior is attached or running.\n")
+        outfile.write("            Use `file EXECUTABLE`, then `attach PID`, then source this script.\n\n")
+        return False
+
+    if not _objfiles():
+        exe_link = f"/proc/{pid}/exe"
+        try:
+            executable = os.path.realpath(exe_link)
+            if not executable or not os.path.isfile(executable):
+                raise RuntimeError(f"{exe_link} is not a readable executable")
+            gdb.execute(f"file {shlex.quote(executable)}", to_string=True)
+            gdb.execute("sharedlibrary", to_string=True)
+            outfile.write(f"[preflight] recovered executable objfile: {executable}\n")
+        except Exception as exc:
+            outfile.write(f"[preflight] ERROR: inferior PID {pid} has no loaded objfiles: {exc}\n")
+            outfile.write("            Load it explicitly with `file EXECUTABLE` before attach.\n\n")
+            return False
+
+    executable = gdb.current_progspace().filename or "<unknown>"
+    outfile.write(f"[preflight] inferior PID: {pid}\n")
+    outfile.write(f"[preflight] executable: {executable}\n")
+    outfile.write(f"[preflight] objfiles: {len(_objfiles())}\n\n")
+    return True
 
 
 def read_memory(addr, size):
@@ -813,23 +872,49 @@ def enumerate_runtime_queues():
     """Walk rocr::core::Runtime::runtime_singleton_ and return a list of
     queue dicts compatible with decode_hsa_queue / decode_dma_queue.
 
-    Plain gdb only - no rocgdb commands. Needs librocr debug symbols.
+    Plain GDB Python only - no ROCgdb-specific commands. Needs DWARF types
+    from the libhsa-runtime64.so that is actually loaded in the inferior.
     """
+    global queue_enum_failure
     queues = []
+    queue_enum_failure = None
+
+    rocr_objfile = _find_rocr_objfile()
+    if rocr_objfile is None:
+        queue_enum_failure = "rocr-not-loaded"
+        outfile.write("[enum] ERROR: no libhsa-runtime64.so objfile is loaded.\n")
+        outfile.write("       HIP/ROCr may not be initialized, or shared-library symbols were not loaded.\n\n")
+        return queues
+
+    rocr_path = rocr_objfile.filename or "<unknown>"
+    outfile.write(f"[enum] ROCr objfile: {rocr_path}\n")
+    try:
+        gdb.lookup_type("rocr::core::Runtime")
+        gdb.lookup_type("rocr::AMD::GpuAgent")
+    except Exception as e:
+        queue_enum_failure = "rocr-dwarf-types-missing"
+        outfile.write("[enum] ERROR: ROCr private C++ DWARF types are unavailable.\n")
+        outfile.write(f"       Loaded ROCr implementation: {rocr_path}\n")
+        outfile.write(f"       Type lookup failed: {e}\n")
+        outfile.write("       A .symtab with function/static names is insufficient for walking\n")
+        outfile.write("       Runtime::gpu_agents_, GpuAgent::aql_queues_, queues_, and blits_.\n")
+        outfile.write("       Run the inferior from startup with an unstripped Debug\n")
+        outfile.write("       libhsa-runtime64.so built from the matching ROCr source.\n\n")
+        return queues
 
     # Quote the class so gdb treats it as a single symbol; the last "::"
     # is otherwise ambiguous with the static-member separator.
     try:
         rt = gdb.parse_and_eval("'rocr::core::Runtime'::runtime_singleton_")
     except Exception as e:
+        queue_enum_failure = "runtime-singleton-unavailable"
         outfile.write(f"[enum] cannot read 'rocr::core::Runtime'::runtime_singleton_: {e}\n")
-        outfile.write("       ROCr debuginfo may be missing or mismatched.\n")
-        outfile.write("       Install an hsa-rocr-debuginfo RPM whose version exactly matches the\n")
-        outfile.write("       installed/mapped hsa-rocr runtime. Example only (use the matching version):\n")
-        outfile.write("         sudo dnf install /path/to/hsa-rocr-debuginfo-1.18.0.70204-93.el8.x86_64.rpm\n\n")
+        outfile.write("       libhsa-runtime64.so is loaded and has types, but the matching\n")
+        outfile.write("       runtime_singleton_ symbol could not be resolved.\n\n")
         return queues
 
     if int(rt) == 0:
+        queue_enum_failure = "runtime-not-initialized"
         outfile.write("[enum] runtime_singleton_ is null - runtime not initialised.\n\n")
         return queues
 
@@ -837,12 +922,14 @@ def enumerate_runtime_queues():
         runtime = rt.dereference()
         gpu_agents_vec = runtime['gpu_agents_']
     except Exception as e:
+        queue_enum_failure = "runtime-layout-unavailable"
         outfile.write(f"[enum] cannot access gpu_agents_: {e}\n\n")
         return queues
 
     try:
         gpu_agent_ptr_t = gdb.lookup_type('rocr::AMD::GpuAgent').pointer()
     except Exception as e:
+        queue_enum_failure = "gpu-agent-type-unavailable"
         outfile.write(f"[enum] cannot find type rocr::AMD::GpuAgent: {e}\n\n")
         return queues
 
@@ -1766,9 +1853,15 @@ def find_and_dump_kmt_waiters():
 
 
 def find_and_decode_queues():
+    global enumerated_queue_count
     outfile.write("--- Enumerating HSA / DMA queues via ROCR runtime singleton ---\n\n")
 
     queues = enumerate_runtime_queues()
+    enumerated_queue_count = len(queues)
+
+    if queue_enum_failure is not None:
+        outfile.write(f"Queue enumeration unavailable ({queue_enum_failure}); no synthetic 0-queue result emitted.\n\n")
+        return
 
     n_hsa  = sum(1 for q in queues if q['type'] == 'HSA')
     n_dma  = sum(1 for q in queues if q['type'] == 'DMA')
@@ -1777,8 +1870,7 @@ def find_and_decode_queues():
                   f"{n_hsa} HSA, {n_dma} DMA, {n_xgmi} XGMI\n\n")
 
     if not queues:
-        outfile.write("No queues found (runtime not initialised or debug "
-                      "symbols missing for librocr).\n")
+        outfile.write("No queues are present in the initialized ROCr runtime.\n")
         return
 
     # DMA/XGMI first, then HSA in original enumeration order.
@@ -1811,19 +1903,26 @@ def find_and_decode_queues():
 # ============================================================
 # Main
 # ============================================================
-try:
-    find_and_decode_queues()
-except Exception as e:
-    outfile.write(f"\nFATAL ERROR in find_and_decode_queues: {e}\n")
-    import traceback
-    outfile.write(traceback.format_exc())
+context_ready = prepare_debugger_context()
+if context_ready:
+    try:
+        find_and_decode_queues()
+    except Exception as e:
+        outfile.write(f"\nFATAL ERROR in find_and_decode_queues: {e}\n")
+        import traceback
+        outfile.write(traceback.format_exc())
 
-try:
-    find_and_dump_interrupt_signal_waiters()
-except Exception as e:
-    outfile.write(f"\nFATAL ERROR in find_and_dump_interrupt_signal_waiters: {e}\n")
-    import traceback
-    outfile.write(traceback.format_exc())
+    if queue_enum_failure is None:
+        try:
+            find_and_dump_interrupt_signal_waiters()
+        except Exception as e:
+            outfile.write(f"\nFATAL ERROR in find_and_dump_interrupt_signal_waiters: {e}\n")
+            import traceback
+            outfile.write(traceback.format_exc())
+    else:
+        outfile.write("Waiter analysis skipped because queue-symbol preflight failed.\n")
+else:
+    outfile.write("Queue and waiter analysis skipped because debugger preflight failed.\n")
 
 # try:
 #     find_and_dump_kmt_waiters()
@@ -1833,7 +1932,21 @@ except Exception as e:
 #     outfile.write(traceback.format_exc())
 
 outfile.close()
-print(f"AQL + SDMA packet decode complete - see {_display_output_path}")
+if not context_ready:
+    raise gdb.GdbError(f"AQL/SDMA decode failed preflight; see {display_output_path}")
+if queue_enum_failure is not None:
+    raise gdb.GdbError(
+        f"AQL/SDMA queue enumeration failed ({queue_enum_failure}); "
+        f"see {display_output_path}"
+    )
+if enumerated_queue_count < 1:
+    raise gdb.GdbError(
+        f"AQL/SDMA decode found no queues; see {display_output_path}"
+    )
+print(
+    f"AQL + SDMA packet decode succeeded: {enumerated_queue_count} queue(s); "
+    f"see {display_output_path}"
+)
 
 
 

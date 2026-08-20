@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+
+# Generated diagnostics and bundles
+*.log
+*.bin
+*.decoded.txt
+*.tgz
+*.tar
+*.tar.*
+*.zip
+gpu_debug_bundle_*/
+cpc_dump_*/
+umr_queue_doctor_*/
+
+# Build, test, and tool caches
+build/
+dist/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.o
+*.a
+*.so
+*.so.*
+
+# Temporary editor and command files
+*.tmp
+*.temp
+*.swp
+*~

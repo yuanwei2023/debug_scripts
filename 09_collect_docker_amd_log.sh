@@ -154,7 +154,7 @@ append_matched_pid() {
 }
 
 AMD_SMI="$(command -v amd-smi 2>/dev/null || true)"
-AMD_SMI_LOG="${RUN_DIR}/amd-smi-process-discovery.log"
+AMD_SMI_LOG="${RUN_DIR}/amd-smi-process-discovery.txt"
 if [[ -n "$EXPLICIT_PID" ]]; then
   add_target_pid "$EXPLICIT_PID"
   printf 'Explicit host PID: %s\n' "$EXPLICIT_PID" >"$AMD_SMI_LOG"
@@ -213,7 +213,7 @@ process_line_matches_name() {
 
 log "checking ${#CONTAINER_IDS[@]} running Docker container(s)"
 for container_id in "${CONTAINER_IDS[@]}"; do
-  top_log="${RUN_DIR}/docker-top-${container_id:0:12}.log"
+  top_log="${RUN_DIR}/docker-top-${container_id:0:12}.txt"
   if ! "$DOCKER" top "$container_id" -eo pid=,comm=,args= >"$top_log" 2>&1; then
     log "warning: docker top failed for ${container_id:0:12}"
     continue
@@ -314,16 +314,16 @@ for container_id in "${!MATCHED_CONTAINER_SET[@]}"; do
   fi
 
   log "copying ${container_name}:${LOG_PATH}"
-  if "$DOCKER" cp "${container_id}:${LOG_PATH}" "${container_dir}/amd.log" \
-    >"${container_dir}/docker-cp.log" 2>&1; then
-    if [[ -f "${container_dir}/amd.log" ]]; then
-      log_size="$(stat -c '%s' "${container_dir}/amd.log")"
+  if "$DOCKER" cp "${container_id}:${LOG_PATH}" "${container_dir}/amd.txt" \
+    >"${container_dir}/docker-cp.txt" 2>&1; then
+    if [[ -f "${container_dir}/amd.txt" ]]; then
+      log_size="$(stat -c '%s' "${container_dir}/amd.txt")"
       printf 'copied_log_size_bytes=%s\n' "$log_size" \
         >>"${container_dir}/capture-info.txt"
       if command -v sha256sum >/dev/null 2>&1; then
         (
           cd "$container_dir"
-          sha256sum amd.log >amd.log.sha256
+          sha256sum amd.txt >amd.txt.sha256
         )
       fi
       ((COPY_COUNT += 1))
