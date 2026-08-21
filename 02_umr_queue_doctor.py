@@ -3327,7 +3327,7 @@ def capture_snapshot(
             continue
 
         register_path = (
-            f"{block}.regSDMA_RLC{state.sdma_queue_id}_*"
+            f"{block}.mmSDMA0_RLC{state.sdma_queue_id}_*"
         )
         register_result = run_command(
             [
