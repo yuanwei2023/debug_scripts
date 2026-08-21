@@ -835,9 +835,26 @@ Queue #4:
             )
             self.assertIn("  Ring base:   0x7f0744e00000", decoded)
             self.assertIn("  Ring size:   128 bytes (2 packet slots)", decoded)
+            self.assertIn("  Snapshot index: 0; queue ID: 4", decoded)
             self.assertIn("  Read index:  0 (slot 0)", decoded)
             self.assertIn("  Write index: 0 (slot 0)", decoded)
+            self.assertIn(
+                "  RPTR ring position: logical=0, slot=0, byte_offset=0x0, "
+                "absolute=0x7f0744e00000",
+                decoded,
+            )
+            self.assertIn(
+                "  WPTR ring position: logical=0, slot=0, byte_offset=0x0, "
+                "absolute=0x7f0744e00000",
+                decoded,
+            )
             self.assertIn("  Pending:     0 packet(s)", decoded)
+            self.assertIn(
+                "RPTR and WPTR use the same logical-index source", decoded
+            )
+            self.assertIn(
+                "WPTR identifies the next producer slot and is excluded", decoded
+            )
             self.assertIn("  Doorbell ID:", decoded)
             self.assertIn("  Decoded slots: 2 / 2", decoded)
             self.assertIn("retain successful .bin captures (default)", decoded)

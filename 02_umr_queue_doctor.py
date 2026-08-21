@@ -2639,6 +2639,17 @@ def capture_full_ring(*, base_command, pid, queue, state, output_dir, snapshot_i
     read_slot = pending["read_slot"]
     write_slot = pending["write_slot"]
     pending_count = pending["pending_count"]
+
+    def format_ring_position(label, logical, slot):
+        if logical is None or slot is None:
+            return f"  {label} ring position: <unavailable>"
+        byte_offset = slot * 64
+        return (
+            f"  {label} ring position: logical={logical}, slot={slot}, "
+            f"byte_offset=0x{byte_offset:x}, "
+            f"absolute=0x{base_address + byte_offset:x}"
+        )
+
     device = (
         f"KFD gpu_id {queue.kfd_gpu_id}"
         if queue.kfd_gpu_id is not None
@@ -2653,6 +2664,7 @@ def capture_full_ring(*, base_command, pid, queue, state, output_dir, snapshot_i
         ),
         f"  Ring base:   0x{base_address:x}",
         f"  Ring size:   {ring_size} bytes ({slot_count} packet slots)",
+        f"  Snapshot index: {snapshot_index}; queue ID: {queue.queue_id}",
         (
             f"  UMR rb_buf_size: {ring_words} dwords "
             f"(converted to {ring_size} bytes)"
@@ -2665,6 +2677,8 @@ def capture_full_ring(*, base_command, pid, queue, state, output_dir, snapshot_i
             f"  Write index: {capture_wptr} (slot {write_slot}) "
             f"[@ {format_optional(state.wptr_poll_address)}]"
         ),
+        format_ring_position("RPTR", capture_rptr, read_slot),
+        format_ring_position("WPTR", capture_wptr, write_slot),
         f"  Pending:     {pending_count} packet(s)",
         (
             "  Pending physical slots: "
@@ -2677,6 +2691,10 @@ def capture_full_ring(*, base_command, pid, queue, state, output_dir, snapshot_i
             f"complete={pending_coverage_complete}"
         ),
         f"  Pointer source: {pointer_source}",
+        (
+            "  Pointer pair capture: RPTR and WPTR use the same logical-index "
+            "source selected above; no CPC raw dword pointers are mixed in"
+        ),
         (
             "  Capture atomicity: non-atomic (native pending dump and "
             "full-ring VM read are separate live commands)"
@@ -2722,6 +2740,10 @@ def capture_full_ring(*, base_command, pid, queue, state, output_dir, snapshot_i
         (
             "  [PENDING logical=N] marks every decoded physical slot in the "
             "logical [RPTR, WPTR) interval."
+        ),
+        (
+            "  WPTR identifies the next producer slot and is excluded from "
+            "pending; it is not the last valid packet."
         ),
         "",
         "Capture command: " + (

@@ -20,11 +20,12 @@ SERVER_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 if SERVER_DIRECTORY not in sys.path:
     sys.path.insert(0, SERVER_DIRECTORY)
 import dashboard
+import full_ring_viewer
 
 
 MALFORMED_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
-SERVER_SEMANTIC_VERSION = "2.0.0"
-SERVER_RELEASE_TIMESTAMP = "2026-08-21 15:53 UTC+8"
+SERVER_SEMANTIC_VERSION = "2.1.1"
+SERVER_RELEASE_TIMESTAMP = "2026-08-21 16:49 UTC+8"
 TEXT_VIEW_EXTENSIONS = (".txt", ".log")
 MAX_PREVIEW_BYTES = 256 * 1024
 MAX_PREVIEW_LINES = 2000
@@ -77,11 +78,27 @@ class TextPreview:
         byte_limited=False,
         line_limited=False,
         clipped_lines=0,
+        line_numbers=None,
+        pointer_roles=None,
+        mode="default",
+        pointer_error=None,
+        scan_limited=False,
+        window=None,
     ):
         self.lines = lines
         self.byte_limited = byte_limited
         self.line_limited = line_limited
         self.clipped_lines = clipped_lines
+        self.line_numbers = (
+            list(line_numbers)
+            if line_numbers is not None
+            else list(range(1, len(lines) + 1))
+        )
+        self.pointer_roles = pointer_roles or {}
+        self.mode = mode
+        self.pointer_error = pointer_error
+        self.scan_limited = scan_limited
+        self.window = window
 
     @property
     def truncated(self):
@@ -423,8 +440,62 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
         stream = self._open_regular_file(path)
         with stream:
             info = os.fstat(stream.fileno())
-            preview = read_text_preview(stream)
-        body = self._render_text_viewer(parts, info, preview).encode("utf-8")
+            relative = "/".join(parts)
+            full_ring = full_ring_viewer.inspect_full_ring(
+                stream, self.root_directory, relative
+            )
+            query = self.path.partition("?")[2]
+            parameters = parse_qs(query, keep_blank_values=True)
+            pointer_mode = (parameters.get("pointer") or [None])[0]
+            if pointer_mode not in ("rptr", "wptr"):
+                pointer_mode = None
+            if full_ring is not None and pointer_mode is not None:
+                context_text = (parameters.get("context") or [""])[0]
+                try:
+                    context = int(context_text, 10)
+                except (TypeError, ValueError):
+                    context = full_ring_viewer.DEFAULT_SLOT_CONTEXT
+                if context not in full_ring_viewer.ALLOWED_SLOT_CONTEXTS:
+                    context = full_ring_viewer.DEFAULT_SLOT_CONTEXT
+                slot_text = (parameters.get("slot") or [""])[0]
+                try:
+                    center_slot = int(slot_text, 10)
+                except (TypeError, ValueError):
+                    center_slot = None
+                if (
+                    center_slot is not None
+                    and not 0 <= center_slot < full_ring.get("slot_count", 0)
+                ):
+                    center_slot = None
+                targeted = full_ring_viewer.read_slot_window(
+                    stream,
+                    full_ring,
+                    pointer_mode,
+                    center_slot=center_slot,
+                    context=context,
+                )
+                if targeted["available"]:
+                    preview = TextPreview(
+                        targeted["lines"],
+                        line_numbers=targeted["line_numbers"],
+                        pointer_roles=targeted["roles"],
+                        mode="slot-window",
+                        scan_limited=targeted["scan_limited"],
+                        window=targeted["window"],
+                    )
+                else:
+                    preview = read_text_preview(stream)
+                    preview.pointer_error = targeted["reason"]
+                    preview.scan_limited = targeted["scan_limited"]
+            else:
+                preview = read_text_preview(stream)
+            if full_ring is not None and preview.mode == "default":
+                preview.pointer_roles = full_ring_viewer.pointer_roles_for_lines(
+                    preview.lines, preview.line_numbers, full_ring
+                )
+        body = self._render_text_viewer(
+            parts, info, preview, full_ring, pointer_mode
+        ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -500,7 +571,229 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
         if send_body:
             self.wfile.write(body)
 
-    def _render_text_viewer(self, parts, info, preview):
+    def _render_full_ring_panel(self, metadata, file_url, preview, pointer_mode):
+        def value(text, fallback="Unavailable"):
+            return html.escape(str(text)) if text is not None else fallback
+
+        def pointer_card(role):
+            label = role.upper()
+            pointer = metadata.get(role + "_view")
+            if pointer is None:
+                return (
+                    '<article class="pointer-card unavailable"><h3>{}</h3>'
+                    '<p>Pointer metadata unavailable</p></article>'
+                ).format(label)
+            return (
+                '<article class="pointer-card {role}"><h3>{label}</h3>'
+                '<dl><div><dt>Logical index</dt><dd>{logical}</dd></div>'
+                '<div><dt>Physical slot</dt><dd>{slot}</dd></div>'
+                '<div><dt>Byte offset</dt><dd>0x{offset:x} ({offset_dec:,})</dd></div>'
+                '<div><dt>Ring address</dt><dd>0x{address:x}</dd></div></dl>'
+                '<p class="pointer-meaning">{meaning}</p></article>'
+            ).format(
+                role=role,
+                label=label,
+                logical=pointer["logical"],
+                slot=pointer["slot"],
+                offset=pointer["byte_offset"],
+                offset_dec=pointer["byte_offset"],
+                address=pointer["address"],
+                meaning=(
+                    "First packet the consumer may process."
+                    if role == "rptr"
+                    else "Next producer slot; not the last valid packet."
+                ),
+            )
+
+        jump_controls = []
+        for role in ("rptr", "wptr"):
+            label = role.upper()
+            if metadata.get(role + "_view") is None:
+                jump_controls.append(
+                    '<span class="pointer-jump disabled" aria-disabled="true">'
+                    "Jump to {}</span>".format(label)
+                )
+            else:
+                href = "{}?pointer={}#pointer-{}".format(file_url, role, role)
+                active = " active" if pointer_mode == role else ""
+                jump_controls.append(
+                    '<a class="pointer-jump{active}" href="{href}">'
+                    "Jump to {label}</a>".format(
+                        active=active,
+                        href=html.escape(href, quote=True),
+                        label=label,
+                    )
+                )
+        if preview.mode != "default":
+            jump_controls.append(
+                '<a class="pointer-jump" href="{}">Default preview</a>'.format(
+                    html.escape(file_url, quote=True)
+                )
+            )
+        if preview.window is not None:
+            window = preview.window
+            context = window["context"]
+            previous_href = (
+                "{}?pointer={}&slot={}&context={}#window-center".format(
+                    file_url,
+                    pointer_mode,
+                    window["previous_center"],
+                    context,
+                )
+            )
+            next_href = "{}?pointer={}&slot={}&context={}#window-center".format(
+                file_url,
+                pointer_mode,
+                window["next_center"],
+                context,
+            )
+            jump_controls.extend(
+                [
+                    '<a class="pointer-jump window-nav" href="{}">'
+                    "\u2190 Previous window</a>".format(
+                        html.escape(previous_href, quote=True)
+                    ),
+                    '<a class="pointer-jump window-nav" href="{}">'
+                    "Next window \u2192</a>".format(
+                        html.escape(next_href, quote=True)
+                    ),
+                ]
+            )
+            context_links = []
+            for candidate in full_ring_viewer.ALLOWED_SLOT_CONTEXTS:
+                href = "{}?pointer={}&slot={}&context={}#window-center".format(
+                    file_url,
+                    pointer_mode,
+                    window["center_slot"],
+                    candidate,
+                )
+                context_links.append(
+                    '<a class="context-choice{}" href="{}">\u00b1{} slots</a>'.format(
+                        " active" if candidate == context else "",
+                        html.escape(href, quote=True),
+                        candidate,
+                    )
+                )
+            jump_controls.append(
+                '<span class="context-choices" aria-label="Slot context">{}</span>'.format(
+                    "".join(context_links)
+                )
+            )
+
+        evidence = []
+        seen = set()
+        for item in metadata.get("evidence", []):
+            source = item.get("path")
+            if not source or source in seen:
+                continue
+            seen.add(source)
+            source_parts = source.replace("\\", "/").split("/")
+            if any(part in ("", ".", "..") for part in source_parts):
+                continue
+            href = encode_url_path(source_parts)
+            line = item.get("line")
+            if isinstance(line, int) and line > 0:
+                href += "#L{}".format(line)
+            evidence.append(
+                '<a href="{}">{}</a>'.format(
+                    html.escape(href, quote=True),
+                    html.escape(item.get("label") or os.path.basename(source)),
+                )
+            )
+        evidence_html = " · ".join(evidence) or "Decoded header only"
+
+        warnings = list(metadata.get("warnings", []))
+        if preview.pointer_error:
+            warnings.append(
+                {
+                    "code": "POINTER_TARGET_UNAVAILABLE",
+                    "message": preview.pointer_error,
+                }
+            )
+        warning_html = ""
+        if warnings:
+            warning_html = '<div class="pointer-warnings" role="alert">{}</div>'.format(
+                "".join(
+                    "<p><strong>{}</strong> {}</p>".format(
+                        html.escape(item.get("code", "WARNING")),
+                        html.escape(item.get("message", "")),
+                    )
+                    for item in warnings
+                )
+            )
+
+        capture_window = " / ".join(
+            item
+            for item in (
+                metadata.get("capture_started"),
+                metadata.get("capture_finished"),
+            )
+            if item
+        )
+        snapshot = metadata.get("snapshot")
+        queue_id = metadata.get("queue_id")
+        identity = "Snapshot {} · Queue {}".format(
+            value(snapshot, "unknown"), value(queue_id, "unknown")
+        )
+        pending_count = metadata.get("pending_count")
+        pending_summary = (
+            "{} packet(s) · wraparound={}".format(
+                pending_count, str(metadata.get("wraps")).lower()
+            )
+            if pending_count is not None
+            else "Unavailable"
+        )
+        companion_status = metadata.get("companion_status")
+        if metadata.get("self_contained"):
+            companion_status = "self-contained decoded header"
+        elif companion_status == "exact":
+            companion_status = "exact snapshot/queue/base companion match"
+        return (
+            '<section class="full-ring-panel" aria-labelledby="pointer-title">'
+            '<div class="pointer-panel-heading"><div>'
+            '<p class="eyebrow">Queue Doctor full-ring pointers</p>'
+            '<h2 id="pointer-title">{identity}</h2></div>'
+            '<div class="pointer-jumps">{jumps}</div></div>'
+            '<p class="interval-note"><strong>Pending is [RPTR, WPTR).</strong> '
+            "RPTR is included; WPTR is excluded and names the next producer slot, "
+            "not the last valid packet.</p>"
+            '<div class="pointer-cards">{rptr_card}{wptr_card}</div>'
+            '<dl class="ring-facts">'
+            '<div><dt>Source artifact</dt><dd><code>{source}</code></dd></div>'
+            '<div><dt>Ring base</dt><dd>{base}</dd></div>'
+            '<div><dt>Capacity</dt><dd>{bytes} bytes · {slots} slots</dd></div>'
+            '<div><dt>Pending interval</dt><dd>{pending}</dd></div>'
+            '<div><dt>Pointer source</dt><dd>{pointer_source}</dd></div>'
+            '<div><dt>Capture relationship</dt><dd>{atomicity}</dd></div>'
+            '<div><dt>Capture window</dt><dd>{capture_window}</dd></div>'
+            '<div><dt>Metadata correlation</dt><dd>{companion}</dd></div>'
+            '<div><dt>Evidence</dt><dd>{evidence}</dd></div></dl>'
+            "{warnings}</section>"
+        ).format(
+            identity=identity,
+            jumps="".join(jump_controls),
+            rptr_card=pointer_card("rptr"),
+            wptr_card=pointer_card("wptr"),
+            source=html.escape(metadata.get("source", "")),
+            base=(
+                "0x{:x}".format(metadata["ring_base"])
+                if metadata.get("ring_base") is not None
+                else "Unavailable"
+            ),
+            bytes=value(metadata.get("ring_size_bytes")),
+            slots=value(metadata.get("slot_count")),
+            pending=html.escape(pending_summary),
+            pointer_source=value(metadata.get("pointer_source")),
+            atomicity=value(metadata.get("atomicity")),
+            capture_window=html.escape(capture_window or "Unavailable"),
+            companion=html.escape(companion_status or "Unavailable"),
+            evidence=evidence_html,
+            warnings=warning_html,
+        )
+
+    def _render_text_viewer(
+        self, parts, info, preview, full_ring=None, pointer_mode=None
+    ):
         file_url = encode_url_path(parts)
         parent_url = encode_url_path(parts[:-1], directory=True)
         breadcrumbs = ['<a href="/">Bundle</a>']
@@ -515,13 +808,36 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
                 )
 
         rendered_lines = []
-        for line_number, line in enumerate(preview.lines, 1):
+        for line_number, line in zip(preview.line_numbers, preview.lines):
+            roles = preview.pointer_roles.get(line_number, set())
+            role_classes = "".join(" pointer-" + role for role in sorted(roles))
+            is_window_center = (
+                preview.window is not None
+                and line_number == preview.window.get("center_line")
+            )
+            if is_window_center:
+                role_classes += " window-center"
+            anchors = "".join(
+                '<span class="pointer-anchor" id="pointer-{}"></span>'.format(role)
+                for role in sorted(roles)
+            )
+            if is_window_center:
+                anchors += '<span class="pointer-anchor" id="window-center"></span>'
+            badges = "".join(
+                '<span class="slot-badge {}">[{}]</span>'.format(
+                    role, role.upper()
+                )
+                for role in sorted(roles)
+            )
             rendered_lines.append(
-                '<div class="log-line" id="L{number}">'
+                '<div class="log-line{role_classes}" id="L{number}">{anchors}'
                 '<a class="line-number" href="#L{number}" '
                 'aria-label="Line {number}">{number}</a>'
-                '<code>{content}</code></div>'.format(
+                '<code>{badges}{content}</code></div>'.format(
                     number=line_number,
+                    role_classes=role_classes,
+                    anchors=anchors,
+                    badges=badges,
                     content=highlight_log_line(line),
                 )
             )
@@ -543,7 +859,28 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
                     MAX_PREVIEW_LINE_CHARS,
                 )
             )
-        if limits:
+        if preview.mode == "slot-window":
+            role = pointer_mode.upper()
+            window = preview.window
+            physical_range = "{} \u2192 {}".format(
+                window["start_slot"], window["end_slot"]
+            )
+            preview_notice = (
+                '<div class="preview-meta window-summary"><strong>Targeted {} '
+                "slot window.</strong> {} complete physical slots rendered "
+                "(range {}; wraparound={}). Logical projection: {} \u2192 {}. "
+                "The selected slot is centered with complete packet blocks above "
+                "and below for normal page scrolling{}.</div>"
+            ).format(
+                role,
+                window["rendered_slot_count"],
+                physical_range,
+                str(window["wraps"]).lower(),
+                window["logical_start"],
+                window["logical_end"],
+                " (bounded scan limit reached)" if preview.scan_limited else "",
+            )
+        elif limits:
             preview_notice = (
                 '<div class="preview-notice" role="status"><strong>Preview limited.</strong> '
                 '{}. Use Raw or Download for the complete file.</div>'.format(
@@ -561,6 +898,13 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
 
         escaped_file_url = html.escape(file_url, quote=True)
         logical_path = "/" + "/".join(parts)
+        full_ring_panel = (
+            self._render_full_ring_panel(
+                full_ring, file_url, preview, pointer_mode
+            )
+            if full_ring is not None
+            else ""
+        )
         return """<!doctype html>
 <html lang="en">
 <head>
@@ -588,6 +932,7 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
       --tok-error:#b42318;--tok-warning:#8a5700;--tok-success:#08783f;
       --tok-info:#175cd3;--tok-hex:#793fa3;--tok-number:#9b3b72;
       --tok-key:#075985;--tok-path:#705600;--tok-comment:#667085;
+      --rptr:#0b7a53;--rptr-bg:#e5f8ef;--wptr:#9a4e00;--wptr-bg:#fff2dc;
     }}
     :root[data-theme="dark"] {{
       color-scheme:dark;--bg:#0f1520;--surface:#171f2d;--surface-2:#1d2737;
@@ -597,6 +942,7 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
       --tok-error:#ff8a80;--tok-warning:#ffd166;--tok-success:#65d89b;
       --tok-info:#82b1ff;--tok-hex:#d7a8ff;--tok-number:#ffb86c;
       --tok-key:#79c7ff;--tok-path:#f0c674;--tok-comment:#93a1b5;
+      --rptr:#7be0b5;--rptr-bg:#143c32;--wptr:#ffc46b;--wptr-bg:#493318;
     }}
     :root[data-theme="amber"] {{
       color-scheme:dark;--bg:#15120c;--surface:#211b11;--surface-2:#2c2314;
@@ -606,6 +952,7 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
       --tok-error:#ff9587;--tok-warning:#ffd76a;--tok-success:#a7df8b;
       --tok-info:#91cfff;--tok-hex:#e7b8ff;--tok-number:#ffbd73;
       --tok-key:#f4c95d;--tok-path:#ffe0a0;--tok-comment:#bfae82;
+      --rptr:#b9df90;--rptr-bg:#26391c;--wptr:#ffcf6a;--wptr-bg:#493412;
     }}
     *{{box-sizing:border-box}}
     html{{scroll-behavior:smooth}}
@@ -629,13 +976,41 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
     .viewer-tools{{display:flex;flex-wrap:wrap;gap:8px;margin-left:auto}}
     .file-meta{{display:flex;flex-wrap:wrap;gap:8px 18px;margin:0 0 13px;color:var(--muted);font-size:13px}}
     .file-meta code{{color:var(--text);overflow-wrap:anywhere}}
+    .full-ring-panel{{margin:0 0 14px;border:1px solid var(--line);border-radius:14px;background:var(--surface);padding:16px;box-shadow:var(--shadow)}}
+    .pointer-panel-heading{{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:12px}}
+    .pointer-panel-heading h2{{margin:0;font-size:20px}}
+    .pointer-jumps{{position:sticky;top:8px;z-index:5;display:flex;flex-wrap:wrap;gap:7px;padding:4px;border:1px solid var(--line);border-radius:11px;background:var(--surface)}}
+    .pointer-jump{{display:inline-block;border:1px solid var(--line);border-radius:8px;padding:7px 10px;color:var(--accent);background:var(--surface-2);font-weight:750;text-decoration:none}}
+    .pointer-jump:hover,.pointer-jump.active{{border-color:var(--accent);background:var(--accent);color:var(--accent-contrast)}}
+    .pointer-jump.disabled{{color:var(--muted);cursor:not-allowed;opacity:.65}}
+    .context-choices{{display:flex;align-items:center;gap:3px;border-left:1px solid var(--line);padding-left:5px}}
+    .context-choice{{border-radius:6px;padding:5px 7px;color:var(--muted);font-size:12px;font-weight:750;text-decoration:none}}
+    .context-choice:hover,.context-choice.active{{color:var(--accent-contrast);background:var(--accent)}}
+    .interval-note{{margin:13px 0;border-left:4px solid var(--accent);border-radius:7px;background:var(--surface-2);padding:10px 12px}}
+    .pointer-cards{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}
+    .pointer-card{{border:1px solid var(--line);border-radius:11px;padding:11px 12px;background:var(--surface-2)}}
+    .pointer-card.rptr{{border-left:5px solid var(--rptr)}}.pointer-card.wptr{{border-left:5px solid var(--wptr)}}
+    .pointer-card h3{{margin:0 0 8px;color:var(--text);font-size:15px}}
+    .pointer-card dl,.ring-facts{{margin:0}}.pointer-card dl{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}}
+    .pointer-card dl div,.ring-facts div{{min-width:0}}dt{{color:var(--muted);font-size:12px;font-weight:750;text-transform:uppercase;letter-spacing:.04em}}
+    dd{{margin:2px 0 0;overflow-wrap:anywhere}}.pointer-meaning{{margin:9px 0 0;color:var(--muted);font-size:13px}}
+    .ring-facts{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:14px}}
+    .ring-facts code{{color:var(--text)}}.ring-facts a{{color:var(--accent)}}
+    .pointer-warnings{{margin-top:12px;border:1px solid var(--tok-warning);border-radius:9px;padding:8px 11px;color:var(--text);background:var(--surface-2)}}
+    .pointer-warnings p{{margin:2px 0}}
     .preview-notice,.preview-meta{{margin:0 0 12px;border:1px solid var(--line);border-radius:10px;background:var(--surface-2);padding:10px 13px;color:var(--muted)}}
     .preview-notice{{border-left:4px solid var(--accent);color:var(--text)}}
     .log-frame{{overflow:hidden;border:1px solid var(--line);border-radius:13px;background:var(--code-bg);box-shadow:var(--shadow)}}
     .log-code{{overflow:auto;max-width:100%;font:13px/1.6 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;tab-size:4}}
-    .log-line{{display:grid;grid-template-columns:5.2rem max-content;min-width:100%;border-bottom:1px solid color-mix(in srgb,var(--line) 55%,transparent)}}
+    .log-line{{position:relative;display:grid;grid-template-columns:5.2rem max-content;min-width:100%;scroll-margin-top:9rem;border-bottom:1px solid color-mix(in srgb,var(--line) 55%,transparent)}}
     .log-line:last-child{{border-bottom:0}}
     .log-line:target,.log-line:hover{{background:var(--surface-2)}}
+    .log-line.pointer-rptr{{box-shadow:inset 5px 0 var(--rptr);background:var(--rptr-bg)}}
+    .log-line.pointer-wptr{{box-shadow:inset 5px 0 var(--wptr);background:var(--wptr-bg)}}
+    .log-line.pointer-rptr.pointer-wptr{{box-shadow:inset 5px 0 var(--rptr),inset 10px 0 var(--wptr)}}
+    .pointer-anchor{{position:absolute;top:0;left:0;width:1px;height:1px;scroll-margin-top:9rem}}
+    .slot-badge{{display:inline-block;margin-right:8px;border:1px solid currentColor;border-radius:999px;padding:0 6px;font-weight:900}}
+    .slot-badge.rptr{{color:var(--rptr);background:var(--rptr-bg)}}.slot-badge.wptr{{color:var(--wptr);background:var(--wptr-bg)}}
     .line-number{{position:sticky;left:0;z-index:1;padding:1px 13px 1px 8px;background:var(--gutter);color:var(--muted);border-right:1px solid var(--line);text-align:right;text-decoration:none;user-select:none;font-variant-numeric:tabular-nums}}
     .log-line code{{display:block;padding:1px 16px;white-space:pre;color:var(--text)}}
     .tok-timestamp{{color:var(--muted)}}.tok-error{{color:var(--tok-error);font-weight:800}}
@@ -652,6 +1027,7 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
       .raw,.download{{flex:1;text-align:center}}.log-code{{font-size:12px}}
       .log-line{{grid-template-columns:3.6rem max-content}}
       .line-number{{padding-right:9px}}.log-line code{{padding-right:12px}}
+      .pointer-cards,.ring-facts{{grid-template-columns:1fr}}.pointer-jumps{{width:100%}}
     }}
   </style>
 </head>
@@ -677,6 +1053,7 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
     </nav>
     <p class="file-meta"><span>Path: <code>{logical_path}</code></span>
       <span>Size: {size}</span><span>Modified: {modified}</span></p>
+    {full_ring_panel}
     {preview_notice}
     <section class="log-frame" aria-label="Highlighted file contents">
       <div class="log-code">{rendered_lines}</div>
@@ -702,6 +1079,7 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
             logical_path=html.escape(logical_path),
             size=html.escape(human_size(info.st_size)),
             modified=html.escape(format_modified(info.st_mtime)),
+            full_ring_panel=full_ring_panel,
             preview_notice=preview_notice,
             rendered_lines="".join(rendered_lines),
             release_footer=release_footer(),
