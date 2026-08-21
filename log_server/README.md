@@ -25,10 +25,33 @@ The **Theme** selector offers Light, Dark, and **暗黄** (dark amber/gold)
 themes. The browser remembers an explicit selection in local storage; the
 system light/dark preference is used only when no saved selection exists.
 
+## GPU queue dashboard
+
+When the served root contains a recognizable GPU debug bundle, the root page
+shows **Analyze GPU queues** and enables the stable `/__dashboard__/` route.
+The dependency-free dashboard correlates CPC queues with KFD HQDs and Queue
+Doctor records only through exact MQD addresses inside independently known
+PCI/XCC context. Filename `gpuN`, UMR instance, KFD node/gpu_id, PCI BDF,
+render node, and AMD-SMI index remain visibly distinct namespaces.
+
+The overview and per-GPU/XCC tables include active/non-empty/empty counts,
+MQD/PQ addresses, queue capacity, raw RPTR/WPTR and physical AQL slots, VMID,
+sampled queue/doorbell bits, pending packet summaries, source links, and
+explicit unmatched or ambiguous joins. Search and filters operate entirely in
+the browser without a network dependency. **Refresh / re-analyze** bypasses
+the in-memory cache; normal requests cache by relevant source mtimes and sizes.
+
+Queue Doctor's repeated same-context snapshots may label a row a **stall
+candidate**. A single CPC/KFD snapshot is never called a confirmed hang.
+Sources were captured non-atomically and at different times, so every page
+retains that caveat. The large Queue Doctor `report.json` is deliberately not
+loaded; bounded summaries, queue listings, and pending packet text provide the
+dashboard fields without embedding huge raw logs.
+
 Run the focused unit tests with:
 
 ```bash
-python3 test_server.py
+python3 -m unittest -v test_server.py test_dashboard.py
 ```
 
 Directory URLs are constrained to the configured root. Traversal, malformed
@@ -54,8 +77,8 @@ original browser/MIME handling.
 ## Release footer
 
 Every generated HTML page shows static release metadata such as
-`v1.2.0 · Released 2026-08-21 13:38 UTC+8`. This is the server release time,
+`v2.0.0 · Released 2026-08-21 15:53 UTC+8`. This is the server release time,
 not the process start time. For a new release, update both
 `SERVER_SEMANTIC_VERSION` and `SERVER_RELEASE_TIMESTAMP` near the top of
-`server.py`; all directory, viewer, and error footers read those single-source
-constants.
+`server.py`; directory, viewer, dashboard, and error footers read those
+single-source constants.

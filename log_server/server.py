@@ -16,10 +16,15 @@ import sys
 from email.utils import formatdate
 from urllib.parse import parse_qs, quote, unquote_to_bytes
 
+SERVER_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+if SERVER_DIRECTORY not in sys.path:
+    sys.path.insert(0, SERVER_DIRECTORY)
+import dashboard
+
 
 MALFORMED_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
-SERVER_SEMANTIC_VERSION = "1.2.0"
-SERVER_RELEASE_TIMESTAMP = "2026-08-21 13:38 UTC+8"
+SERVER_SEMANTIC_VERSION = "2.0.0"
+SERVER_RELEASE_TIMESTAMP = "2026-08-21 15:53 UTC+8"
 TEXT_VIEW_EXTENSIONS = (".txt", ".log")
 MAX_PREVIEW_BYTES = 256 * 1024
 MAX_PREVIEW_LINES = 2000
@@ -281,6 +286,21 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_request(self, send_body):
         try:
+            raw_path = self.path.partition("?")[0]
+            if raw_path == "/__dashboard__":
+                self.send_response(301)
+                self.send_header("Location", "/__dashboard__/")
+                self.send_header("Content-Length", "0")
+                self._send_security_headers()
+                self.end_headers()
+                return
+            if raw_path == "/__dashboard__/":
+                if not dashboard.is_gpu_debug_bundle(self.root_directory):
+                    raise RequestPathError(404, "Dashboard unavailable")
+                query = self.path.partition("?")[2]
+                parameters = parse_qs(query, keep_blank_values=True)
+                self._serve_dashboard("refresh" in parameters, send_body)
+                return
             parts = decode_request_path(self.path)
             path, path_info = self._resolve_path(parts)
             if stat.S_ISDIR(path_info.st_mode):
@@ -305,6 +325,25 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_error_page(
                     request_error.status, request_error.message, send_body
                 )
+
+    def _serve_dashboard(self, force_refresh, send_body):
+        try:
+            model = dashboard.analyze_bundle(
+                self.root_directory, force=force_refresh
+            )
+            rendered = dashboard.render_dashboard(model, release_footer())
+        except ValueError:
+            raise RequestPathError(404, "Dashboard unavailable")
+        except Exception:
+            raise RequestPathError(500, "Dashboard analysis failed")
+        body = rendered.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_security_headers()
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
 
     def _resolve_path(self, parts):
         candidate = os.path.abspath(os.path.join(self.root_directory, *parts))
@@ -729,6 +768,13 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
                 '<tr><td class="empty" colspan="5">This directory is empty.</td></tr>'
             )
 
+        dashboard_action = ""
+        if not parts and dashboard.is_gpu_debug_bundle(self.root_directory):
+            dashboard_action = (
+                '<a class="dashboard-action" href="/__dashboard__/">'
+                "Analyze GPU queues</a>"
+            )
+
         logical_path = "/" + "/".join(parts)
         return """<!doctype html>
 <html lang="en">
@@ -775,9 +821,12 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
     .eyebrow{{margin:0 0 5px;color:var(--accent);font-size:12px;font-weight:750;letter-spacing:.12em;text-transform:uppercase}}
     h1{{margin:0;font-size:clamp(25px,4vw,38px);letter-spacing:-.035em}}
     .subtitle{{margin:7px 0 0;color:var(--muted)}}
+    .header-actions{{display:flex;align-items:center;flex-wrap:wrap;gap:9px}}
     .theme-control{{display:flex;align-items:center;gap:9px;border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:6px 8px 6px 11px;color:var(--muted);font-size:13px;font-weight:700}}
     .theme-control select{{min-width:104px;border:1px solid var(--line);border-radius:7px;color:var(--text);background:var(--surface-2);padding:6px 28px 6px 9px;font:inherit;font-weight:700;cursor:pointer}}
     .back,.download,.open{{border:1px solid var(--line);border-radius:9px;color:var(--text);background:var(--surface);padding:8px 12px;font:inherit;font-weight:650;text-decoration:none;cursor:pointer;transition:.15s}}
+    .dashboard-action{{display:inline-block;border:1px solid var(--accent);border-radius:9px;background:var(--accent);color:var(--accent-contrast);padding:9px 13px;font-weight:750;text-decoration:none}}
+    .dashboard-action:hover{{background:var(--accent-hover);border-color:var(--accent-hover);transform:translateY(-1px)}}
     .back:not(.disabled):hover,.open:hover{{border-color:var(--accent);color:var(--accent);transform:translateY(-1px)}}
     a:focus-visible,select:focus-visible{{outline:3px solid var(--focus);outline-offset:2px}}
     .disabled{{opacity:.45;cursor:default}}
@@ -819,14 +868,14 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
     <header>
       <div><p class="eyebrow">Diagnostics</p><h1>GPU Debug Bundle</h1>
         <p class="subtitle">Browse and download collected GPU diagnostics.</p></div>
-      <label class="theme-control" for="theme-select">
+      <div class="header-actions">{dashboard_action}<label class="theme-control" for="theme-select">
         <span>Theme</span>
         <select id="theme-select" aria-label="Choose visual theme">
           <option value="light">Light</option>
           <option value="dark">Dark</option>
           <option value="amber">\u6697\u9ec4</option>
         </select>
-      </label>
+      </label></div>
     </header>
     <nav class="toolbar" aria-label="Directory navigation">{back}<div class="crumbs">{breadcrumbs}</div></nav>
     <p class="path">Current path: {logical_path}</p>
@@ -855,6 +904,7 @@ class GPUBundleRequestHandler(http.server.BaseHTTPRequestHandler):
             breadcrumbs="".join(breadcrumbs),
             logical_path=html.escape(logical_path),
             rows="".join(rows),
+            dashboard_action=dashboard_action,
             release_footer=release_footer(),
         )
 
