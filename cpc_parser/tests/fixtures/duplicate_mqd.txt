@@ -1,0 +1,22 @@
+Global Registers:
+    CPC_STATUS: 00000000 |
+
+me1.pipe0.queue0
+Queue Memory Registers:
+    PQ_BASE: 0000000000100000 | PQ_RPTR: 00000000 |
+    PQ_WPTR_LO: 00000000 | PQ_WPTR_HI: 00000000 |
+    MQD_BASE: 0000000000abc000 |
+Queue Other Registers:
+    PQ_CONTROL: 0000800a | VMID: 00000001 |
+MQD:
+    0x080: 00abc000 | 00000000 | 00000001 | 00000001 |
+
+me1.pipe1.queue0
+Queue Memory Registers:
+    PQ_BASE: 0000000000200000 | PQ_RPTR: 00000000 |
+    PQ_WPTR_LO: 00000000 | PQ_WPTR_HI: 00000000 |
+    MQD_BASE: 0000000000abc000 |
+Queue Other Registers:
+    PQ_CONTROL: 0000800a | VMID: 00000002 |
+MQD:
+    0x080: 00abc000 | 00000000 | 00000001 | 00000002 |

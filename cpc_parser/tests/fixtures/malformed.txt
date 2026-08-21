@@ -1,0 +1,4 @@
+This is not a complete CPC capture.
+BROKEN: xyz |
+me.bad.pipe
+0x080: not-hex | also-bad |

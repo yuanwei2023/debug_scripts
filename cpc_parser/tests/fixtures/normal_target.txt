@@ -1,0 +1,36 @@
+Global Registers:
+    CPC_STATUS: b0000041 | CPC_BUSY_STAT: 00000401 |
+
+------------------------------------------------------
+me1.pipe0
+
+Pipe Registers:
+    MEC1_INSTR_PNTR: 000041e3 | HPD_STATUS0: 21000448 |
+
+------------------------------------------------------
+me1.pipe0.queue2
+
+Queue Memory Registers:
+    PQ_BASE: 00007f0744e00000 | PQ_RPTR: 0001bb9c |
+    PQ_WPTR_LO: 00d9cc40 | PQ_WPTR_HI: 00000000 |
+    MQD_BASE: 0000000001795000 |
+
+Queue Other Registers:
+    ERROR: 00000000 | HQ_STATUS0: 0010c040 |
+    PERSISTENT_STATE: 40005301 | PQ_CONTROL: 14014511 |
+    PQ_DOORBELL_CONTROL: e000400a | VMID: 00000303 |
+
+Queue Wave/Event Registers:
+    SPI_CSQ_WF_ACTIVE_COUNT: 00000000 | 00000000 |
+    00000000 | 00000000 |
+
+MQD:
+    0x080: 01795000 | 00000000 | 00000001 | 00000303 |
+    0x084: 40005301 | 00000001 |
+           00000000 | 00000111 |
+    0x088: 0744e000 | 0000007f | 00000000 | 52944080 |
+    0x08c: 00007f07 | 52944038 | 00007f07 | 0000400a |
+    0x090: 00000000 | 14014511 | 00000000 | 00000000 |
+
+Scratch Memory:
+    0x000: deadbeef | 00000000 |

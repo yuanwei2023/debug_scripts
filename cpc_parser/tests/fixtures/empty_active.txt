@@ -1,0 +1,22 @@
+Global Registers:
+    CPC_STATUS: 00000000 |
+
+me1.pipe0
+
+Pipe Registers:
+    MEC1_INSTR_PNTR: 00000001 |
+
+me1.pipe0.queue0
+
+Queue Memory Registers:
+    PQ_BASE: 000000000064b000 | PQ_RPTR: 00000200 |
+    PQ_WPTR_LO: 00000200 | PQ_WPTR_HI: 00000000 |
+    MQD_BASE: 000000000065c000 |
+
+Queue Other Registers:
+    ERROR: 00000000 | HQ_STATUS0: 400080c0 |
+    PQ_CONTROL: 1401c511 | PQ_DOORBELL_CONTROL: e0000042 |
+    VMID: 00000000 |
+
+MQD:
+    0x080: 0065c000 | 00000000 | 00000001 | 00000000 |
